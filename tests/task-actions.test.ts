@@ -6,6 +6,7 @@ import { applyEvent, type TaskEvent } from '../src/tasks/repository'
 
 const now = Date.parse('2030-11-14T11:00:00Z')
 const event = { groupId: 'group-a', userId: 'user-a', now, eventTime: now }
+const checkListFirst = { type: 'text', text: expect.stringMatching(/^まず「一覧を見る」.*有効期限/) }
 let platform: PlatformProxy<Env>
 
 beforeAll(async () => {
@@ -46,6 +47,8 @@ test('confirms once even under redelivery and competing clicks', async () => {
   ])
 
   expect(results.filter((result) => result?.type === 'text' && result.text.includes('登録しました'))).toHaveLength(1)
+  expect(results).toContainEqual(checkListFirst)
+  expect(await dispatch('after-confirm', { type: 'confirm', token })).toMatchObject(checkListFirst)
   expect(await list()).toMatchObject({ tasks: [{ title: '水筒', due_date: '2030-11-20', category: 'deadline' }] })
   expect(await platform.env.DB.prepare('SELECT count(*) FROM processed_events WHERE event_id = ?')
     .bind('confirm').first('count(*)')).toBe(1)
@@ -72,7 +75,8 @@ test('expires sessions at ten minutes and invalidates an earlier confirmation on
   const token = await draft('first')
   const later = now + 10 * 60 * 1000
   expect(await dispatch('expired', { type: 'confirm', token }, { now: later, eventTime: later }))
-    .toMatchObject({ text: expect.stringContaining('有効期限') })
+    .toMatchObject(checkListFirst)
+  expect(await list()).toMatchObject({ tasks: [] })
   const newToken = await draft('second')
   expect(await dispatch('old', { type: 'confirm', token })).toMatchObject({ text: expect.stringContaining('有効期限') })
   await dispatch('current', { type: 'confirm', token: newToken })
@@ -105,6 +109,22 @@ test('scopes complete and delete by group and ID, even for tasks with the same t
   expect(await list()).toMatchObject({ tasks: [] })
   const { results } = await platform.env.DB.prepare('SELECT id, status FROM tasks').all()
   expect(results).toEqual([{ id: first.id, status: 'done' }])
+})
+
+test('deletes once under competing confirmations and guides a later click to the list', async () => {
+  await dispatch('created', { type: 'confirm', token: await draft('delete') })
+  const result = await list()
+  if (result?.type !== 'list') throw new Error('Expected a task list')
+  const deletion = await dispatch('request-delete', { type: 'request_delete', taskId: result.tasks[0].id })
+  if (deletion?.type !== 'confirm_delete') throw new Error('Expected a delete confirmation')
+  const action = { type: 'confirm', token: deletion.token } as const
+
+  const replies = await Promise.all([dispatch('delete-1', action), dispatch('delete-2', action)])
+  expect(replies).toEqual(expect.arrayContaining([
+    { type: 'text', text: 'タスクを削除しました。' }, checkListFirst,
+  ]))
+  expect(await dispatch('delete-3', action)).toMatchObject(checkListFirst)
+  expect(await list()).toMatchObject({ tasks: [] })
 })
 
 test('lists the first 20 open tasks in due-date order', async () => {

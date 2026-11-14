@@ -21,6 +21,7 @@ export type ActionResult =
 
 const inputExample = '日付とタイトルを送ってください。例 11/20 遠足の同意書（10分以内）'
 const expired = '操作の有効期限が切れたか、すでに処理済みです。メニューからやり直してください。'
+const inactiveConfirmation = 'まず「一覧を見る」で操作結果を確認してください。この確認ボタンは有効期限切れか、すでに使われた可能性があります。必要ならメニューから操作し直してください。'
 const missing = '対象が見つかりません。'
 
 function textResult(text: string): ActionResult {
@@ -77,7 +78,7 @@ export async function dispatchAction(db: D1Database, event: TaskEvent, action: T
 async function confirmAction(db: D1Database, event: TaskEvent, token: string) {
   const session = await getSession(db, event)
   if (!session || session.token !== token || session.state === 'awaiting_input') {
-    if (!await wasProcessed(db, event.eventId)) return textResult(expired)
+    if (!await wasProcessed(db, event.eventId)) return textResult(inactiveConfirmation)
     return
   }
 
@@ -94,7 +95,7 @@ async function confirmAction(db: D1Database, event: TaskEvent, token: string) {
   const results = await applyEvent(db, event, change, consume)
   if (!results) return
   const [task, currentSession] = results
-  if (!currentSession.meta.changes) return textResult(expired)
+  if (!currentSession.meta.changes) return textResult(inactiveConfirmation)
   if (!task.meta.changes) return textResult(missing)
   return textResult(session.state === 'confirm_create' ? 'タスクを登録しました。' : 'タスクを削除しました。')
 }
