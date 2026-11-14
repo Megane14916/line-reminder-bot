@@ -15,7 +15,7 @@ CREATE INDEX tasks_group_status_due_date ON tasks (group_id, status, due_date);
 CREATE TABLE interaction_sessions (
   group_id TEXT NOT NULL,
   user_id TEXT NOT NULL,
-  state TEXT NOT NULL CHECK (state IN ('awaiting_input', 'confirm_create', 'confirm_delete')),
+  state TEXT NOT NULL CHECK (state IN ('idle', 'awaiting_input', 'confirm_create', 'confirm_delete')),
   token TEXT NOT NULL,
   payload_json TEXT NOT NULL,
   expires_at INTEGER NOT NULL,
