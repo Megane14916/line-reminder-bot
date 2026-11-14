@@ -1,101 +1,146 @@
-import {
-  applyEvent, completeTask, confirmDraft, consumeSession, deleteTask, findOpenTask,
-  getSession, insertTask, listTasks, startSession, wasProcessed,
-  type Task, type TaskCategory, type TaskDraft, type TaskEvent,
-} from './repository'
-import { looksLikeTaskInput, parseTaskInput, todayInJapan } from './validation'
+import { intentSchema, type TargetAction, type TaskAction } from './intent'
+import { applyEvent, findTasks, getContext, getTask, listTasks, saveContext, type Task, type TaskEvent } from './repository'
+import { changeReminderTime, defaultRule, describeSchedule, reminderSlots, ruleSchema } from './schedule'
+import { todayInJapan } from './validation'
 
-export type TaskAction =
-  | { type: 'start_create'; category: TaskCategory }
-  | { type: 'submit_input'; text: string }
-  | { type: 'list' }
-  | { type: 'complete'; taskId: number }
-  | { type: 'request_delete'; taskId: number }
-  | { type: 'confirm'; token: string }
+export const help = 'Bot にメンションして「12月20日までにレポート提出」「来週の締切を教えて」「レポート完了」「水筒の通知は前日21時だけ」などと送ってください。通知への引用返信で「終わった」と送っても完了できます。'
+export const clarify = '操作を一つずつ、必要な日付やタスク名を添えて教えてください。'
 
-export type ActionResult =
-  | { type: 'text'; text: string }
-  | { type: 'confirm_create'; draft: TaskDraft; token: string }
-  | { type: 'confirm_delete'; task: Task; token: string }
-  | { type: 'list'; tasks: Task[]; truncated: boolean }
-
-const inputExample = '日付とタイトルを送ってください。例 11/20 遠足の同意書（10分以内）'
-const expired = '操作の有効期限が切れたか、すでに処理済みです。メニューからやり直してください。'
-const inactiveConfirmation = 'まず「一覧を見る」で操作結果を確認してください。この確認ボタンは有効期限切れか、すでに使われた可能性があります。必要ならメニューから操作し直してください。'
-const missing = '対象が見つかりません。'
-
-function textResult(text: string): ActionResult {
-  return { type: 'text', text }
-}
-
-export async function dispatchAction(db: D1Database, event: TaskEvent, action: TaskAction): Promise<ActionResult | undefined> {
+export async function dispatchAction(db: D1Database, event: TaskEvent, action: TaskAction): Promise<string | undefined> {
   switch (action.type) {
-    case 'list':
-      return { type: 'list', ...await listTasks(db, event.groupId) }
-    case 'start_create': {
-      const statement = startSession(db, event, {
-        state: 'awaiting_input', token: crypto.randomUUID(), payload: { category: action.category },
-      })
-      const results = await applyEvent(db, event, statement)
-      if (results) return textResult(results[0].meta.changes ? inputExample : expired)
+    case 'help': return help
+    case 'unknown': return `操作を読み取れませんでした。${help}`
+    case 'clarify': return clarify
+    case 'list_tasks': {
+      const { tasks, truncated } = await listTasks(db, event.groupId, action)
+      return tasks.length ? `${tasks.map(taskLine).join('\n')}${truncated ? '\n最初の20件を表示しています。' : ''}` : '該当するタスクはありません。'
+    }
+    case 'set_group_default': {
+      const update = db.prepare(`INSERT INTO group_reminder_defaults (group_id, rule_json) VALUES (?, ?)
+        ON CONFLICT(group_id) DO UPDATE SET rule_json = excluded.rule_json`).bind(event.groupId, JSON.stringify(action.rule))
+      if (await applyEvent(db, event, update)) return '今後登録するタスクの通知設定を変更しました。'
       return
     }
-    case 'submit_input': {
-      if (!looksLikeTaskInput(action.text)) return
-
-      const session = await getSession(db, event)
-      if (session?.state !== 'awaiting_input') return
-
-      const input = parseTaskInput(action.text, event.now)
-      if (!input) return textResult(`日付またはタイトルを確認してください。${inputExample}`)
-
-      const draft = { ...input, category: session.payload.category }
-      const token = crypto.randomUUID()
-      const results = await applyEvent(db, event, confirmDraft(db, event, session.token, token, draft))
-      if (results?.[0].meta.changes) return { type: 'confirm_create', draft, token }
-      return
-    }
-    case 'complete': {
-      const results = await applyEvent(db, event, completeTask(db, event, action.taskId))
-      if (results) return textResult(results[0].meta.changes ? 'タスクを完了しました。' : missing)
-      return
-    }
-    case 'request_delete': {
-      const task = await findOpenTask(db, event.groupId, action.taskId)
-      if (!task) return textResult(missing)
-
-      const token = crypto.randomUUID()
-      const statement = startSession(db, event, { state: 'confirm_delete', token, payload: { taskId: task.id } })
-      const results = await applyEvent(db, event, statement)
-      if (results) return results[0].meta.changes ? { type: 'confirm_delete', task, token } : textResult(expired)
-      return
-    }
-    case 'confirm':
-      return confirmAction(db, event, action.token)
+    case 'create_task': return createTask(db, event, action)
+    default: return targetOperation(db, event, action)
   }
 }
 
-async function confirmAction(db: D1Database, event: TaskEvent, token: string) {
-  const session = await getSession(db, event)
-  if (!session || session.token !== token || session.state === 'awaiting_input') {
-    if (!await wasProcessed(db, event.eventId)) return textResult(inactiveConfirmation)
-    return
+async function createTask(db: D1Database, event: TaskEvent, action: Extract<TaskAction, { type: 'create_task' }>) {
+  if (action.dueDate < todayInJapan(event.now)) return '過去の日付は締切に指定できません。'
+  const configured = action.rule ? null : await db.prepare('SELECT rule_json FROM group_reminder_defaults WHERE group_id = ?')
+    .bind(event.groupId).first<string>('rule_json')
+  const rule = action.rule ?? (configured ? ruleSchema.parse(JSON.parse(configured)) : defaultRule)
+  const next = reminderSlots(rule, action.dueDate, event.now, event.now)[0] ?? null
+  const insert = db.prepare(`INSERT INTO tasks (group_id, category, title, due_date, created_by, created_at,
+    reminder_rule, reminder_anchor, next_reminder_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .bind(event.groupId, action.category, action.title, action.dueDate, event.userId, event.now, JSON.stringify(rule), event.now, next)
+  if (await applyEvent(db, event, insert, saveContext(db, event, action.type, 'new', null, true))) {
+    return `「${action.title}」を登録しました。期限 ${action.dueDate}\n通知 ${describeSchedule(rule, action.dueDate, event.now, event.now)}`
   }
+}
 
-  const consume = consumeSession(db, event, token)
-  if (session.state === 'confirm_create' && session.payload.dueDate < todayInJapan(event.now)) {
-    const results = await applyEvent(db, event, consume)
-    if (results) return textResult('期限が過ぎました。メニューから登録し直してください。')
-    return
+export async function answerSelection(db: D1Database, event: TaskEvent, id: number) {
+  const context = await getContext(db, event)
+  if (!context?.pending_json) return
+  const pending: { action: unknown; ids: number[] } = JSON.parse(context.pending_json)
+  if (!pending.ids.includes(id)) return '候補の #番号 を送ってください。'
+  const selected = intentSchema.safeParse({ ...(pending.action as object), target: { by: 'id', id } })
+  if (selected.success && 'target' in selected.data) {
+    const task = await getTask(db, event.groupId, id)
+    if (!task || (task.deleted_at !== null) !== (selected.data.type === 'restore_task')) return '該当するタスクが見つかりません。'
+    return changeTask(db, event, selected.data, task, { pending: context.pending_json })
   }
+}
 
-  const change = session.state === 'confirm_create'
-    ? insertTask(db, event, token, session.payload)
-    : deleteTask(db, event, token, session.payload.taskId)
-  const results = await applyEvent(db, event, change, consume)
-  if (!results) return
-  const [task, currentSession] = results
-  if (!currentSession.meta.changes) return textResult(inactiveConfirmation)
-  if (!task.meta.changes) return textResult(missing)
-  return textResult(session.state === 'confirm_create' ? 'タスクを登録しました。' : 'タスクを削除しました。')
+async function targetOperation(db: D1Database, event: TaskEvent, action: TargetAction) {
+  const target = action.target
+  let task: Task | null = null
+  if (target.by === 'name') {
+    const candidates = await findTasks(db, event.groupId, target.name, target.dueDate, action.type === 'restore_task')
+    if (candidates.length > 1) {
+      const options = candidates.slice(0, 5)
+      const { target: _target, ...operation } = action
+      const pending = JSON.stringify({ action: operation, ids: options.map(({ id }) => id) })
+      if (!await applyEvent(db, event, saveContext(db, event, action.type, null, pending))) return
+      return `どのタスクですか？ #番号 を送ってください。\n${options.map(taskLine).join('\n')}${candidates.length > 5 ? '\nほかにも候補があります。日付を添えると絞り込めます。' : ''}`
+    }
+    task = candidates[0] ?? null
+  } else {
+    const id = target.by === 'id' ? target.id : (await getContext(db, event))?.task_id
+    if (id) task = await getTask(db, event.groupId, id)
+  }
+  if (!task || (task.deleted_at !== null) !== (action.type === 'restore_task')) return '該当するタスクが見つかりません。タスク名や #番号 を教えてください。'
+  return changeTask(db, event, action, task, target.by === 'recent' ? { recent: task.id } : undefined)
+}
+
+async function changeTask(db: D1Database, event: TaskEvent, action: TargetAction, task: Task,
+  context?: { pending: string } | { recent: number }) {
+  let rule = ruleSchema.parse(JSON.parse(task.reminder_rule))
+  let anchor = task.reminder_anchor ?? task.created_at
+  let { title, category, due_date: dueDate, status, deleted_at: deletedAt, reminder_enabled: enabled } = task
+  let reply: string
+  switch (action.type) {
+    case 'get_reminder':
+      if (!await applyEvent(db, event, saveContext(db, event, action.type, task.id))) return
+      return `「${title}」の通知 ${enabled && status === 'open' ? describeSchedule(rule, dueDate, anchor, event.now) : '停止中です。'}`
+    case 'update_task':
+      if (action.dueDate && action.dueDate < todayInJapan(event.now)) return '過去の日付は締切に指定できません。'
+      if (action.dueDate && action.dueDate !== dueDate) anchor = event.now
+      title = action.title ?? title
+      category = action.category ?? category
+      dueDate = action.dueDate ?? dueDate
+      reply = `「${title}」を変更しました。期限 ${dueDate}${action.dueDate ? '\n通知 ' + (enabled && status === 'open' ? describeSchedule(rule, dueDate, anchor, event.now) : '停止中です。') : ''}`
+      break
+    case 'complete_task':
+      if (status === 'done') return `「${title}」は完了済みです。`
+      status = 'done'
+      reply = `「${title}」を完了にしました。`
+      break
+    case 'reopen_task':
+      if (status === 'open') return `「${title}」は未完了です。`
+      status = 'open'
+      reply = `「${title}」の完了を取り消しました。`
+      break
+    case 'delete_task':
+      deletedAt = event.now
+      reply = `「${title}」を削除しました。`
+      break
+    case 'restore_task':
+      deletedAt = null
+      reply = `「${title}」を復元しました。`
+      break
+    case 'set_reminder':
+      if (action.setting.by === 'time') rule = changeReminderTime(rule, action.setting.time, dueDate, anchor)
+      else {
+        rule = action.setting.rule
+        anchor = event.now
+      }
+      enabled = 1
+      reply = `「${title}」の通知を変更しました。\n${status === 'open' ? describeSchedule(rule, dueDate, anchor, event.now) : '完了を取り消すと通知が再開します。'}`
+      break
+    case 'disable_reminder':
+      enabled = 0
+      reply = `「${title}」の通知を停止しました。`
+      break
+    case 'enable_reminder':
+      enabled = 1
+      reply = `「${title}」の通知を再開しました。`
+      break
+  }
+  const next = enabled && status === 'open' && deletedAt === null ? reminderSlots(rule, dueDate, anchor, event.now)[0] ?? null : null
+  const contextGuard = context ? `AND EXISTS (SELECT 1 FROM task_contexts WHERE group_id = ? AND user_id = ?
+    AND ${'pending' in context ? 'pending_json' : 'task_id'} = ? AND expires_at > ? AND updated_at <= ?)` : ''
+  const update = db.prepare(`UPDATE tasks SET title = ?, category = ?, due_date = ?, status = ?, deleted_at = ?,
+    completed_at = ?, reminder_rule = ?, reminder_enabled = ?, reminder_anchor = ?, next_reminder_at = ?,
+    reminder_version = reminder_version + 1 WHERE group_id = ? AND id = ? AND reminder_version = ? ${contextGuard}`)
+    .bind(title, category, dueDate, status, deletedAt, status === 'done' ? task.status === 'done' ? task.completed_at : event.now : null,
+      JSON.stringify(rule), enabled, anchor, next, event.groupId, task.id, task.reminder_version,
+      ...(context ? [event.groupId, event.userId, 'pending' in context ? context.pending : context.recent, event.now, event.eventTime] : []))
+  const results = await applyEvent(db, event, update, saveContext(db, event, action.type, task.id, null, true))
+  if (results) return results[0].meta.changes ? reply : '別の操作が先に反映されました。現在の状態を一覧で確認してください。'
+}
+
+function taskLine(task: Task) {
+  return `#${task.id} ${task.due_date} ［${task.category === 'deadline' ? '期限' : '持ち物'}］${task.title}`
 }

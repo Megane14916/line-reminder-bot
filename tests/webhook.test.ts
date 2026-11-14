@@ -1,322 +1,198 @@
-import { afterAll, afterEach, beforeAll, expect, test, vi } from 'vitest'
-import { getPlatformProxy, unstable_splitSqlQuery, type PlatformProxy } from 'wrangler'
-import migration from '../migrations/0001_init.sql?raw'
+import { afterAll, afterEach, beforeAll, beforeEach, expect, test, vi } from 'vitest'
 import { app } from '../src/index'
+import { parseIntent } from '../src/line/intent-parser'
+import { runReminders } from '../src/reminders'
+import { testPlatform } from './platform'
 
-// LINE's published signature verification example.
-const bindings = {
-  LINE_CHANNEL_SECRET: '8c570fa6dd201bb328f1c1eac23a96d8',
-  LINE_CHANNEL_ACCESS_TOKEN: 'test-access-token',
-}
-const exampleBody = '{"destination":"U8e742f61d673b39c7fff3cecb7536ef0","events":[]}'
-const exampleSignature = 'GhRKmvmHys4Pi8DxkF4+EayaH0OqtJtaZxgTD9fMDLs='
+const secret = 'test-secret'
+const now = Date.parse('2030-12-01T10:00:00+09:00')
+const group = 'group-a'
+const model = '@cf/qwen/qwen3-30b-a3b-fp8'
+const infer = vi.fn()
+const ai = { run: infer } as unknown as Ai
+let platform: Awaited<ReturnType<typeof testPlatform>>
+const line = vi.fn<typeof fetch>()
+const byName = (name: string) => ({ by: 'name', name })
+const recent = { by: 'recent' }
 
-let platform: PlatformProxy<Env>
-beforeAll(async () => {
-  platform = await getPlatformProxy<Env>({ persist: false, remoteBindings: false, envFiles: [] })
-  await platform.env.DB.batch(unstable_splitSqlQuery(migration).map((sql) => platform.env.DB.prepare(sql)))
-}, 20_000)
+beforeAll(async () => { platform = await testPlatform() }, 20_000)
 afterAll(async () => await platform?.dispose())
+beforeEach(async () => {
+  const { DB } = platform.env
+  await DB.batch(['reminder_occurrences', 'tasks', 'task_contexts', 'processed_events', 'group_reminder_defaults']
+    .map((table) => DB.prepare('DELETE FROM ' + table)))
+  vi.spyOn(Date, 'now').mockReturnValue(now)
+  infer.mockReset()
+  line.mockReset().mockImplementation(async () => new Response('{}'))
+  vi.stubGlobal('fetch', line)
+})
+afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks() })
 
-const source = { type: 'group', groupId: 'test-group', userId: 'test-user' }
-const mentionEvent = {
-  type: 'message',
-  mode: 'active',
-  source,
-  replyToken: 'test-reply-token',
-  message: {
-    type: 'text',
-    text: '@家族Bot',
-    mention: { mentionees: [{ isSelf: true, index: 0, length: 6, type: 'user' }] },
-  },
-}
-const postbackEvent = { type: 'postback', mode: 'active', source, replyToken: 'test-postback-token' }
-
-function post(body: string, signature?: string, waitUntil = vi.fn()) {
-  return app.request('/webhook/line', {
-    method: 'POST',
-    headers: signature ? { 'x-line-signature': signature } : {},
-    body,
-  }, { ...bindings, DB: platform.env.DB }, { waitUntil, passThroughOnException: vi.fn(), props: {} })
-}
-
-async function sign(body: string) {
+async function webhook(events: unknown[], options: { raw?: string; tampered?: boolean; missing?: boolean } = {}) {
+  const body = options.raw ?? JSON.stringify({ events })
   const encoder = new TextEncoder()
-  const key = await crypto.subtle.importKey(
-    'raw', encoder.encode(bindings.LINE_CHANNEL_SECRET),
-    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'],
-  )
-  const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(body))
-  return btoa(String.fromCharCode(...new Uint8Array(signature)))
-}
-
-async function postEvents(events: unknown[]) {
-  const body = JSON.stringify({ events: events.map((event) => ({
-    webhookEventId: crypto.randomUUID(), timestamp: Date.now(), ...event as object,
-  })) })
-  const waitUntil = vi.fn<(promise: Promise<unknown>) => void>()
-  const response = await post(body, await sign(body), waitUntil)
-  await Promise.all(waitUntil.mock.calls.map(([promise]) => promise))
+  const key = await crypto.subtle.importKey('raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
+  const mac = await crypto.subtle.sign('HMAC', key, encoder.encode(body))
+  const signature = btoa(String.fromCharCode(...new Uint8Array(mac)))
+  const work: Promise<unknown>[] = []
+  const response = await app.request('/webhook/line', {
+    method: 'POST', body: options.tampered ? body + '\\n' : body,
+    headers: options.missing ? {} : { 'x-line-signature': signature },
+  }, { ...platform.env, LINE_CHANNEL_SECRET: secret, LINE_CHANNEL_ACCESS_TOKEN: 'test-token', AI: ai, AI_MODEL: model },
+  { waitUntil: (promise) => { work.push(promise) }, passThroughOnException: vi.fn(), props: {} })
+  await Promise.all(work)
   return response
 }
 
-function mockReply() {
-  const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response('{}'))
-  vi.stubGlobal('fetch', fetchMock)
-  return fetchMock
+function event(text: string, options: { mention?: boolean; groupId?: string; userId?: string; quote?: string; id?: string; timestamp?: number } = {}) {
+  const bot = '@家族Bot'
+  return {
+    type: 'message', mode: 'active', webhookEventId: options.id ?? crypto.randomUUID(),
+    timestamp: options.timestamp ?? Date.now(), replyToken: 'test-reply-token',
+    source: { type: 'group', groupId: options.groupId ?? group, userId: options.userId ?? 'user-a' },
+    message: { type: 'text', text: options.mention ? bot + (text ? ' ' + text : '') : text,
+      mention: options.mention ? { mentionees: [{ isSelf: true, index: 0, length: bot.length }] } : undefined,
+      quotedMessageId: options.quote },
+  }
 }
 
-afterEach(() => {
-  vi.unstubAllGlobals()
-  vi.restoreAllMocks()
+async function command(text: string, action: unknown, options: Parameters<typeof event>[1] = {}) {
+  infer.mockResolvedValueOnce({ response: action })
+  expect((await webhook([event(text, { mention: true, ...options })])).status).toBe(200)
+  return lastReply()
+}
+
+function lastReply() {
+  const match = line.mock.calls.filter(([url]) => String(url).endsWith('/reply')).at(-1)
+  return match && JSON.parse(String(match[1]?.body)).messages[0].text as string | undefined
+}
+
+function taskRows() {
+  return platform.env.DB.prepare('SELECT * FROM tasks ORDER BY id').all()
+}
+
+test('validates signatures and empty events without invoking AI or LINE', async () => {
+  expect((await webhook([])).status).toBe(200)
+  expect((await webhook([], { missing: true })).status).toBe(401)
+  expect((await webhook([], { tampered: true })).status).toBe(401)
+  expect((await webhook([], { raw: '{' })).status).toBe(400)
+  expect(infer).not.toHaveBeenCalled()
+  expect(line).not.toHaveBeenCalled()
 })
 
-test('accepts a signed empty webhook', async () => {
-  const response = await post(exampleBody, exampleSignature)
-
-  expect(response.status).toBe(200)
+test('replies to a bot-only mention with text and ignores conversation, other mentions and legacy buttons', async () => {
+  const other = event('こんにちは')
+  const old = { ...other, type: 'postback', postback: { data: 'delete:1' } }
+  await webhook([event('明日の夕飯？'), event('@家族Bot'), {
+    ...other, message: { ...other.message, mention: { mentionees: [{ isSelf: false, index: 0, length: 2 }] } },
+  }, old])
+  expect(line).not.toHaveBeenCalled()
+  await webhook([event('', { mention: true })])
+  expect(lastReply()).toContain('Bot にメンションして')
+  expect(infer).not.toHaveBeenCalled()
 })
 
-test.each([
-  ['a missing signature', exampleBody, undefined],
-  ['malformed base64', exampleBody, 'invalid!'],
-  ['a tampered body', `${exampleBody}\n`, exampleSignature],
-  ['unsigned malformed JSON', '{', exampleSignature],
-])('returns 401 for %s', async (_description, body, signature) => {
-  const response = await post(body, signature)
-
-  expect(response.status).toBe(401)
+test('creates and deduplicates a related create-and-reminder request and lists by date and category', async () => {
+  const request = event('12月20日のレポートを登録。1週間前から毎日通知して', { mention: true })
+  const rule = { type: 'repeat', startDaysBefore: 7, endDaysBefore: 1, everyDays: 1, weekdays: [], times: ['20:00'] }
+  infer.mockResolvedValue({ choices: [{ message: { content: JSON.stringify({
+    type: 'create_task', title: 'レポート', category: 'deadline', dueDate: '2030-12-20', rule,
+  }) } }] })
+  await webhook([request])
+  await webhook([request])
+  expect(infer).toHaveBeenCalledTimes(1)
+  expect(infer.mock.calls[0][1]).toMatchObject({ messages: [expect.anything(), { role: 'user', content: '12月20日のレポートを登録。1週間前から毎日通知して' }],
+    response_format: { type: 'json_object' } })
+  expect(lastReply()).toContain('登録しました')
+  expect((await taskRows()).results).toMatchObject([{ reminder_rule: JSON.stringify(rule), next_reminder_at: Date.parse('2030-12-13T20:00:00+09:00') }])
+  expect(await command('12月の提出物', { type: 'list_tasks', from: '2030-12-01', to: '2030-12-31', category: 'deadline' })).toContain('レポート')
 })
 
-test.each(['{', '{"events":{}}'])('returns 400 for a signed invalid payload %s', async (body) => {
-  const response = await post(body, await sign(body))
-
-  expect(response.status).toBe(400)
+test('updates, completes, reopens, logically deletes, restores and manages notifications through recent context', async () => {
+  await command('12月20日までにレポート提出', { type: 'create_task', title: 'レポート', category: 'deadline', dueDate: '2030-12-20' })
+  expect(await command('レポートを作文に変えて12月23日締切', { type: 'update_task', target: byName('レポート'),
+    title: '作文', dueDate: '2030-12-23' })).toContain('2030-12-23')
+  expect(await command('やっぱり3日前と前日だけ', { type: 'set_reminder', target: recent, setting: { by: 'rule',
+    rule: { type: 'offsets', slots: [{ daysBefore: 3, time: '20:00' }, { daysBefore: 1, time: '20:00' }] } } })).toContain('2030-12-20')
+  expect(await command('通知時間を21時に変えて', { type: 'set_reminder', target: recent,
+    setting: { by: 'time', time: '21:00' } })).toContain('21:00')
+  expect(await command('このタスクはいつ通知？', { type: 'get_reminder', target: recent })).toContain('2030-12-22 21:00')
+  await command('通知停止', { type: 'disable_reminder', target: recent })
+  expect((await taskRows()).results[0].next_reminder_at).toBeNull()
+  await command('通知を再開', { type: 'enable_reminder', target: recent })
+  expect((await taskRows()).results[0].next_reminder_at).toBe(Date.parse('2030-12-20T21:00:00+09:00'))
+  await command('作文終わった', { type: 'complete_task', target: byName('作文') })
+  expect((await taskRows()).results[0]).toMatchObject({ status: 'done', next_reminder_at: null })
+  await command('作文を未完了に戻して', { type: 'reopen_task', target: byName('作文') })
+  expect((await taskRows()).results[0]).toMatchObject({ status: 'open', next_reminder_at: expect.any(Number) })
+  await command('作文を削除して', { type: 'delete_task', target: byName('作文') })
+  expect((await taskRows()).results[0]).toMatchObject({ deleted_at: now, next_reminder_at: null })
+  await command('作文を復元して', { type: 'restore_task', target: byName('作文') })
+  expect((await taskRows()).results[0]).toMatchObject({ deleted_at: null, next_reminder_at: expect.any(Number) })
 })
 
-test.each(['@家族Bot  ', '@家族Bot 明日の持ち物を教えて'])('replies with the Flex menu for %s', async (text) => {
-  const fetchMock = mockReply()
-
-  const response = await postEvents([{ ...mentionEvent, message: { ...mentionEvent.message, text } }])
-
-  expect(response.status).toBe(200)
-  expect(fetchMock).toHaveBeenCalledTimes(1)
-  const [url, request] = fetchMock.mock.calls[0]
-  expect(url).toBe('https://api.line.me/v2/bot/message/reply')
-  expect(request?.method).toBe('POST')
-  const headers = new Headers(request?.headers)
-  expect(headers.get('Authorization')).toBe('Bearer test-access-token')
-  expect(headers.get('Content-Type')).toBe('application/json')
-  expect(headers.has('X-Line-Retry-Key')).toBe(false)
-  expect(JSON.parse(String(request?.body))).toMatchObject({
-    replyToken: 'test-reply-token',
-    messages: [{
-      type: 'flex',
-      altText: '家族Botの操作メニュー',
-      contents: {
-        type: 'bubble',
-        body: {
-          type: 'box',
-          layout: 'vertical',
-          contents: [
-            { type: 'button', action: { type: 'postback', label: '期限を追加', data: 'add_deadline' } },
-            { type: 'button', action: { type: 'postback', label: '持ち物を追加', data: 'add_belonging' } },
-            { type: 'button', action: { type: 'postback', label: '一覧を見る', data: 'list_tasks' } },
-            { type: 'button', action: { type: 'postback', label: '使い方', data: 'help' } },
-          ],
-        },
-      },
-    }],
-  })
-})
-
-test.each([
-  ['add_deadline', '日付とタイトルを送ってください。'],
-  ['add_belonging', '日付とタイトルを送ってください。'],
-  ['list_tasks', '未完了のタスクはありません。'],
-  ['help', '操作メニューを開きます。'],
-])('replies to the %s postback', async (data, expectedText) => {
-  const fetchMock = mockReply()
-
-  const response = await postEvents([{ ...postbackEvent, source: { ...source, userId: data }, postback: { data } }])
-
-  expect(response.status).toBe(200)
-  expect(fetchMock).toHaveBeenCalledTimes(1)
-  expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toEqual({
-    replyToken: 'test-postback-token',
-    messages: [{ type: 'text', text: expect.stringContaining(expectedText) }],
-  })
-})
-
-test.each([
-  ['ordinary chat', { ...mentionEvent, message: { type: 'text', text: 'おかえり' } }],
-  ['the bot name as plain text', { ...mentionEvent, message: { type: 'text', text: '@家族Bot' } }],
-  ['another user mention', { ...mentionEvent, message: { ...mentionEvent.message, mention: { mentionees: [{ isSelf: false }] } } }],
-  ['an image', { ...mentionEvent, message: { type: 'image' } }],
-  ['a direct message', { ...mentionEvent, source: { type: 'user', userId: 'test-user' } }],
-  ['standby mode', { ...mentionEvent, mode: 'standby' }],
-  ['a missing reply token', { ...mentionEvent, replyToken: undefined }],
-  ['an unknown postback action', { ...postbackEvent, postback: { data: 'unknown' } }],
-  ['extra postback data', { ...postbackEvent, postback: { data: 'help&taskId=1' } }],
-  ['a postback outside a group', { ...postbackEvent, source: { type: 'room', userId: 'test-user' }, postback: { data: 'help' } }],
-  ['a postback missing a group ID', { ...postbackEvent, source: { ...source, groupId: '' }, postback: { data: 'help' } }],
-  ['a postback missing a sender', { ...postbackEvent, source: { ...source, userId: undefined }, postback: { data: 'help' } }],
-])('ignores %s', async (_description, event) => {
-  const fetchMock = mockReply()
-
-  const response = await postEvents([event])
-
-  expect(response.status).toBe(200)
-  expect(fetchMock).not.toHaveBeenCalled()
-})
-
-test('acknowledges a batch and settles all replies when some fail', async () => {
-  const fetchMock = mockReply()
-  const log = vi.spyOn(console, 'error').mockImplementation(() => {})
-  let finishFirstReply!: (response: Response) => void
-  fetchMock.mockImplementationOnce(() => new Promise((resolve) => { finishFirstReply = resolve }))
-  fetchMock.mockRejectedValueOnce(new Error('private network error detail'))
-  const body = JSON.stringify({ events: [
-    { ...mentionEvent, webhookEventId: 'http-failure' },
-    { ...postbackEvent, postback: { data: 'help' }, webhookEventId: 'network-failure' },
-    { ...mentionEvent, replyToken: 'another-reply-token', webhookEventId: 'success' },
-  ] })
-  const waitUntil = vi.fn<(promise: Promise<unknown>) => void>()
-
-  const response = await post(body, await sign(body), waitUntil)
-  expect(response.status).toBe(200)
-  expect(fetchMock).toHaveBeenCalledTimes(3)
-  expect(waitUntil).toHaveBeenCalledTimes(1)
-
-  finishFirstReply(new Response(null, { status: 500 }))
-  await expect(waitUntil.mock.calls[0][0]).resolves.toEqual([undefined, undefined, undefined])
-  expect(log.mock.calls).toEqual([
-    ['LINE reply failed', { action: 'help', eventId: 'network-failure', kind: 'network' }],
-    ['LINE reply failed', { action: 'menu', eventId: 'http-failure', kind: 'http', status: 500 }],
-  ])
-})
-
-test('keeps a committed task and does not retry its failed reply on redelivery', async () => {
-  const fetchMock = mockReply()
-  const log = vi.spyOn(console, 'error').mockImplementation(() => {})
-  const taskSource = { ...source, groupId: 'reply-failure' }
-
-  await postEvents([{ ...postbackEvent, source: taskSource, postback: { data: 'add_deadline' } }])
-  await postEvents([{ ...mentionEvent, source: taskSource, message: { type: 'text', text: '2099-11-20 遠足' } }])
-  const confirmation = JSON.parse(String(fetchMock.mock.lastCall?.[1]?.body)).messages[0]
-  const data = confirmation.contents.body.contents[1].action.data
-  const event = { ...postbackEvent, source: taskSource, postback: { data }, webhookEventId: 'failed-confirm-reply' }
-
-  fetchMock.mockClear().mockResolvedValueOnce(new Response(null, { status: 400 }))
-  expect((await postEvents([event])).status).toBe(200)
-  expect((await postEvents([event])).status).toBe(200)
-
-  expect(fetchMock).toHaveBeenCalledTimes(1)
-  expect(log.mock.calls).toEqual([
-    ['LINE reply failed', { action: 'confirm', eventId: 'failed-confirm-reply', kind: 'http', status: 400 }],
-  ])
-  expect(await platform.env.DB.prepare('SELECT COUNT(*) AS total FROM tasks WHERE group_id = ?')
-    .bind(taskSource.groupId).first('total')).toBe(1)
-})
-
-test('ignores chat during input, keeps the session and replies to date-like errors', async () => {
-  const fetchMock = mockReply()
-  const taskSource = { ...source, groupId: 'input-filter' }
-  const message = (text: string, userId = taskSource.userId) => ({
-    ...mentionEvent, source: { ...taskSource, userId }, message: { type: 'text', text },
-  })
-  const lastReply = () => JSON.parse(String(fetchMock.mock.lastCall?.[1]?.body)).messages[0]
-  await postEvents([{ ...postbackEvent, source: taskSource, postback: { data: 'add_deadline' } }])
-
-  const session = () => platform.env.DB.prepare('SELECT * FROM interaction_sessions WHERE group_id = ? AND user_id = ?')
-    .bind(taskSource.groupId, taskSource.userId).first()
-  const waiting = await session()
-  expect(waiting).toMatchObject({ state: 'awaiting_input' })
-
-  fetchMock.mockClear()
-  await postEvents([message('今日の晩ご飯何？'), message('今日の晩ご飯何？', 'someone-else'),
-    message('2099-11-20 遠足', 'someone-else')])
-  expect(fetchMock).not.toHaveBeenCalled()
-  expect(await session()).toEqual(waiting)
-
-  await postEvents([{ ...mentionEvent, source: taskSource }])
-  expect(lastReply()).toMatchObject({ type: 'flex', altText: '家族Botの操作メニュー' })
-
-  for (const input of ['11/31 遠足', '11/20', `11/20 ${'あ'.repeat(101)}`]) {
-    await postEvents([message(input)])
-    expect(lastReply()).toMatchObject({ type: 'text', text: expect.stringContaining('日付またはタイトルを確認') })
+test('keeps ambiguous selection scoped to the initiating user and group', async () => {
+  for (const dueDate of ['2030-12-20', '2030-12-23']) {
+    await command('水筒を登録', { type: 'create_task', title: '水筒', category: 'belonging', dueDate })
   }
-  expect(await session()).toEqual(waiting)
-
-  await postEvents([message('2099-11-20 遠足')])
-  expect(lastReply()).toMatchObject({ type: 'flex', altText: '登録の確認' })
+  expect(await command('水筒完了', { type: 'complete_task', target: byName('水筒') })).toContain('どのタスク')
+  const [first, second] = (await taskRows()).results
+  const token = '#' + second.id
+  await webhook([event(token, { userId: 'user-b' }), event(token, { groupId: 'group-b' })])
+  expect((await taskRows()).results).toMatchObject([{ status: 'open' }, { status: 'open' }])
+  await webhook([event(token)])
+  expect((await taskRows()).results).toMatchObject([{ id: first.id, status: 'open' }, { id: second.id, status: 'done' }])
+  expect(await command(token + '削除', { type: 'delete_task', target: { by: 'id', id: second.id } }, { groupId: 'group-b' })).toContain('見つかりません')
+  expect(await command('やっぱり通知停止', { type: 'disable_reminder', target: recent }, { userId: 'user-b' })).toContain('見つかりません')
 })
 
-test('runs the group task flow through signed webhooks and LINE postbacks', async () => {
-  const fetchMock = mockReply()
-  const taskSource = { ...source, groupId: 'task-flow' }
-  const text = (value: string, userId = taskSource.userId) => ({
-    ...mentionEvent, source: { ...taskSource, userId }, message: { type: 'text', text: value },
-  })
-  const press = (data: string, webhookEventId = crypto.randomUUID()) => ({
-    ...postbackEvent, source: taskSource, postback: { data }, webhookEventId,
-  })
-  const messages = () => JSON.parse(String(fetchMock.mock.lastCall?.[1]?.body)).messages
-  const date = '2099-11-20'
-
-  await postEvents([press('add_deadline')])
-  expect(messages()[0].text).toContain('日付とタイトル')
-  fetchMock.mockClear()
-  await postEvents([text(`${date} 遠足の同意書`, 'someone-else')])
-  expect(fetchMock).not.toHaveBeenCalled()
-
-  await postEvents([text(`${date} 遠足の同意書`)])
-  const create = messages()[0].contents.body.contents[1].action.data
-  const buttonEvent = press(create)
-  await postEvents([buttonEvent])
-  expect(messages()[0].text).toContain('登録しました')
-  fetchMock.mockClear()
-  await postEvents([buttonEvent])
-  expect(fetchMock).not.toHaveBeenCalled()
-
-  await postEvents([press('add_belonging'), text(`${date} 水筒`)])
-  const addBelonging = messages()[0].contents.body.contents[1].action.data
-  await postEvents([press(addBelonging)])
-  await postEvents([press('list_tasks')])
-  const list = messages()[0].contents.contents
-  expect(list).toHaveLength(2)
-  expect(list[0].body.contents[0].text).toContain('遠足の同意書')
-  expect(list[1].body.contents[0].text).toContain('水筒')
-
-  await postEvents([press(list[0].body.contents[1].action.data)])
-  expect(messages()[0].text).toContain('完了しました')
-  await postEvents([press(list[1].body.contents[2].action.data)])
-  expect(messages()[0].altText).toBe('削除の確認')
-  const remove = messages()[0].contents.body.contents[1].action.data
-  await postEvents([press('list_tasks')])
-  expect(messages()[0].contents.contents).toHaveLength(1)
-  await postEvents([press(remove)])
-  expect(messages()[0].text).toContain('削除しました')
-  await postEvents([press('list_tasks')])
-  expect(messages()[0].text).toContain('未完了のタスクはありません')
+test('uses a group default only for subsequently registered tasks in that group', async () => {
+  const task = { type: 'create_task', title: '提出物', category: 'deadline', dueDate: '2030-12-20' }
+  await command('提出物登録', task)
+  const rule = { type: 'offsets', slots: [{ daysBefore: 1, time: '21:00' }] }
+  await command('今後登録するタスクは前日21時', { type: 'set_group_default', rule })
+  await command('提出物登録', task)
+  await command('提出物登録', task, { groupId: 'group-b' })
+  expect((await taskRows()).results.map((row) => JSON.parse(String(row.reminder_rule)))).toEqual([{ type: 'default' }, rule, { type: 'default' }])
 })
 
-test('returns a retryable response when D1 fails to process an event', async () => {
-  const fetchMock = mockReply()
-  const log = vi.spyOn(console, 'error').mockImplementation(() => {})
-  const body = JSON.stringify({ events: [{
-    ...postbackEvent, postback: { data: 'add_deadline' }, webhookEventId: 'retryable', timestamp: Date.now(),
-    source: { ...source, groupId: 'simulate-db-failure' },
-  }] })
-  const db = platform.env.DB
-  await db.prepare(`CREATE TRIGGER fail_session_insert BEFORE INSERT ON interaction_sessions
-    WHEN NEW.group_id = 'simulate-db-failure' BEGIN SELECT RAISE(ABORT, 'test D1 error'); END`).run()
+test.each([
+  { type: 'create_task', title: 'test', category: 'deadline', dueDate: '2030-02-30' },
+  { type: 'create_task', title: 'test', category: 'deadline', dueDate: '2029-12-30' },
+  { type: 'delete_all' },
+  { type: 'create_task', title: 'test', category: 'deadline', dueDate: '2030-12-20', groupId: 'group-b' },
+  [{ type: 'help' }, { type: 'unknown' }], '{',
+])('validates AI output before running database actions (%j)', async (action) => {
+  await command('テスト', action)
+  expect((await taskRows()).results).toEqual([])
+  expect(lastReply()).toMatch(/読み取れ|過去/)
+})
 
-  const response = await post(body, await sign(body))
+test('handles inference timeouts and transport failures without an action', async () => {
+  infer.mockImplementationOnce(() => new Promise(() => {}))
+  await expect(parseIntent(ai, model, '今日の締切', now, 5)).resolves.toBeUndefined()
+  infer.mockRejectedValueOnce(new Error('network failed'))
+  await webhook([event('今日の締切', { mention: true })])
+  expect(lastReply()).toContain('読み取れません')
+})
 
-  expect(response.status).toBe(503)
-  expect(fetchMock).not.toHaveBeenCalled()
-  expect(log).toHaveBeenCalledWith('LINE task action failed', 'start_create')
-  expect(await db.prepare('SELECT event_id FROM processed_events WHERE event_id = ?').bind('retryable').first())
-    .toBeNull()
+test.each(['終わった', '完了', '✅'])('quotes an accepted push to complete once and stop future notices (%s)', async (text) => {
+  await command('水筒を登録', { type: 'create_task', title: '水筒', category: 'belonging', dueDate: '2030-12-20' })
+  const slot = Number((await taskRows()).results[0].next_reminder_at)
+  line.mockImplementation(async (url) => String(url).endsWith('/push')
+    ? new Response('{"sentMessages":[{"id":987654321012345678}]}') : new Response('{}'))
+  const env = { ...platform.env, LINE_CHANNEL_ACCESS_TOKEN: 'test-token' }
+  await runReminders(env, () => slot)
+  expect((await platform.env.DB.prepare('SELECT * FROM reminder_occurrences').first())).toMatchObject({ line_message_id: '987654321012345678' })
+  await webhook([event('ありがとう', { quote: '987654321012345678' }), event(text, { quote: '987654321012345678', groupId: 'group-b' })])
+  expect((await taskRows()).results[0].status).toBe('open')
+  const completion = event(text, { quote: '987654321012345678', timestamp: slot })
+  vi.spyOn(Date, 'now').mockReturnValue(slot)
+  await webhook([completion])
+  expect(lastReply()).toContain('完了にしました')
+  const completed = (await taskRows()).results[0]
+  await webhook([completion, event(text, { quote: '987654321012345678' })])
+  expect((await taskRows()).results[0]).toEqual(completed)
+  await runReminders(env, () => Date.parse('2030-12-19T20:00:00+09:00'))
+  expect(line.mock.calls.filter(([url]) => String(url).endsWith('/push'))).toHaveLength(1)
 })

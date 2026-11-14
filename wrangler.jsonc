@@ -3,7 +3,9 @@
   "name": "line-reminder-bot",
   "main": "src/index.ts",
   "compatibility_date": "2026-11-14",
-  "triggers": { "crons": ["0 11 * * *", "*/5 * * * *"] },
+  "triggers": { "crons": ["* * * * *"] },
+  "ai": { "binding": "AI" },
+  "vars": { "AI_MODEL": "@cf/qwen/qwen3-30b-a3b-fp8" },
   "d1_databases": [
     {
       "binding": "DB",
