@@ -1,57 +1,57 @@
 # Family LINE Bot
 
-家族の LINE グループで提出物や持ち物を管理するための Bot です。開発計画は [docs/PLAN.md](docs/PLAN.md) を参照してください。
+LINE グループで家族の提出物や持ち物を管理します。Bot にメンションして、次のように送ってください。日時は日本時間です。
 
-## ローカル起動
+| 操作 | 送信例 |
+| --- | --- |
+| 登録 | 12月20日までにレポート提出 |
+| 通知付き登録 | 12月20日締切のレポートを登録して。1週間前から毎日20時に通知して |
+| 一覧 | 来週締切の提出物を教えて |
+| 変更 | レポートの名前を作文にして、期限を12月23日に変更して |
+| 完了・取り消し | レポート終わった ／ レポートを未完了に戻して |
+| 削除・復元 | 水筒のタスクを削除して ／ 水筒のタスクを復元して |
+| 通知設定 | やっぱり3日前と当日の朝8時に通知して |
+| 繰り返し | 2週間前から毎週月曜に通知して ／ 締切まで2日おきに通知して |
+| 通知の停止・再開・確認 | このタスクの通知を止めて ／ 通知を再開して ／ いつ通知される？ |
+| 今後のグループ既定値 | 今後登録するタスクはすべて前日21時に通知して |
 
-Node.js 24 LTS と npm を用意し、PowerShell で実行します。
+メンションだけを送ると使い方が表示されます。同名候補を聞かれたときは、表示された `#番号` を10分以内に返信します。「さっきのタスク」「やっぱり」は同じグループ・送信者の直近10分の操作を参照します。削除済みのタスクも復元できます。過去のタスクは復元しても過ぎた通知は送りません。
 
-```powershell
-npm ci
-npx wrangler d1 migrations apply DB --local
-npm run dev
-```
+Bot の通知を LINE の引用返信機能で引用し、「終わった」「完了」「✅」などと送ると対象タスクを完了できます。引用元の ID が記録できなかった場合は、Bot にメンションしてタスク名と「完了」を送ってください。
 
-別の PowerShell で `Invoke-WebRequest http://localhost:8787/health` を実行すると HTTP 200 が返ります。
+## 通知ルール
 
-## 環境変数
+- 既定では登録時に期限まで8日以上あれば7日前と前日、2〜7日なら前日の20:00に通知します。当日・翌日が期限の場合も、同じ計算から未来の時刻だけが残ります。時刻未指定は20:00、「朝」は08:00、「夜」は20:00です。
+- 日付ごとの指定は最大10枠、繰り返しは最大4時刻と曜日または日間隔を指定できます。期限からの相対日数は最大366日です。「締切まで毎日」のような登録日からの繰り返しは長期タスクにも使えます。
+- 各タスクについて毎回次の1件だけを計算し、毎分の Cron が対象を処理します。通知はタスクごと・予定時刻ごとに1件です。停止・完了・削除・ルール変更は旧バージョンの未送信分を無効にします。送信権取得後にすでに開始した LINE へのリクエストは取り消せません。
+- 送信権は2分、リクエストのタイムアウトは10秒です。本文と Retry Key を保存し、5xx・通信失敗には5・10・20分の間隔で最大4回（初回込み）試行します。429 は最低15分または `Retry-After` の長い方を待ちます。予定から1時間後または JST の日付が変わる時点のうち早い方で送信を打ち切ります。
+- `sent` は LINE API の受理を示します。受理済み409でもメッセージIDがないことがあります。結果不明の行を消したり Retry Key を作り直したりすると重複送信につながります。障害時は `reminder_occurrences` の `status`、`last_error_kind`、`attempt_count`、`last_attempt_at` を確認してください。
 
-ヘルスチェックとテストは環境変数なしで動きます。LINE 連携時は `.dev.vars.example` を `.dev.vars` にコピーし、`LINE_CHANNEL_SECRET` と `LINE_CHANNEL_ACCESS_TOKEN` を設定します。`.dev.vars` は Git 管理対象外です。
+## ローカル開発と検証
 
-Webhook のパスは `POST /webhook/line` です。テスト用の LINE グループで Bot にメンションを送って操作メニューを開きます。
-
-1. 「期限を追加」または「持ち物を追加」を押し、`11/20 水筒` や `2030-11-20 遠足の同意書` の形式で送ります。
-2. 確認メッセージの「登録する」を押します。入力と確認の有効期限はそれぞれ10分です。
-3. 「一覧を見る」で未完了のタスクを表示します。「完了」はその場で確定し、「削除」は確認ボタンを押すと確定します。
-
-## 前日リマインダー
-
-毎日 20:00 JST（Cron は `0 11 * * *` UTC）に、翌日が期限の未完了タスクをグループごとに1通の LINE メッセージで送ります。対象がない場合は送信しません。当日20時を過ぎて登録したタスクはその日の通知対象から外れます。LINE の文字数上限に達する場合は、収まらないタスクを「ほか N 件」と表示します。
-
-通知本文と Retry Key は送信前に D1 に保存します。再試行 Cron は5分ごとに保存済み通知だけを確認します。HTTP 5xx・通信エラー・タイムアウトでは最低5分から間隔を倍にし、HTTP 429 では最低15分または `Retry-After` が指定する長い方の時間を待ちます。400・401・403 などの恒久エラーは自動再試行の対象外です。試行は初回を含め最大4回で、D1 に通知を保存してから24時間以内に限ります。
-
-D1 が送信権を2分間確保し、1回の LINE リクエストは10秒でタイムアウトします。Worker が停止したり、送信結果を D1 に保存できなかったりして `pending` が残った場合は、送信権の期限後に同じ本文とキーで再試行します。LINE がそのキーの受理済みを示す HTTP 409 を返した場合は `sent` に更新します。
-
-未配信が疑われるときは、対象日とログの処理段階を照合し、`notification_batches` の `status`、`last_error_kind`、`http_status`、`attempt_count`、`last_attempt_at`、`next_attempt_at` を確認してください。恒久エラーは設定やグループ参加状態を確認します。初回の D1 保存に失敗した場合はバッチが作成されず、自動再試行の対象外です。バッチがない場合や上限・期限に達した場合は、LINE グループで受信状況を確認してください。結果が不明なバッチの削除や Retry Key の作り直しは二重送信につながります。`sent` は LINE API がリクエストを受理した記録です。端末への到達は保証されません。[LINE の Retry Key](https://developers.line.biz/ja/docs/messaging-api/retrying-api-request/)
-
-## 検証
+Node.js 24 LTS と npm を使用します。PowerShell で実行します。
 
 ```powershell
-npm run typecheck
-npm test
-npx wrangler deploy --dry-run
+npm.cmd ci
+npx.cmd wrangler d1 migrations apply DB --local
+npm.cmd run dev
 ```
 
-ローカルで通知を試すには、テスト用グループで翌日期限のタスクを登録した後、公開トンネルを停止してから、そのローカル D1 を使う Worker を `npm run dev -- --test-scheduled` で起動します。テスト用 LINE チャネルの設定で次を実行すると、その時点を基準に通知が送られます。同じ日に繰り返しても同じグループへの通知は1通です。
+`GET /health` と `POST /webhook/line` が公開ルートです。LINE 実機確認ではテスト用チャネルの `LINE_CHANNEL_SECRET` と `LINE_CHANNEL_ACCESS_TOKEN` を、Git 管理外の `.dev.vars` に設定します。テスト用 HTTPS URL の末尾に `/webhook/line` を付けて LINE Developers で登録・検証し、Webhook とグループ参加を有効にします。標準の自動応答は LINE Official Account Manager でオフにしてください。
+
+ローカル Cron は公開トンネルを停止した状態で `npm.cmd run dev -- --test-scheduled` を起動し、通知予定時刻に以下を実行します。テスト用グループ・チャネルとローカル D1 を使用してください。
 
 ```powershell
-Invoke-RestMethod 'http://localhost:8787/cdn-cgi/local/scheduled?cron=0+11+*+*+*&format=json'
+Invoke-RestMethod 'http://localhost:8787/cdn-cgi/local/scheduled?cron=*+*+*+*+*&format=json'
+npm.cmd run typecheck
+npm.cmd test
+npx.cmd wrangler deploy --dry-run
 ```
 
-## 手動デプロイ
+テストはモック AI・LINE API とローカル D1 を使います。ローカル Worker で実際にメンション操作をすると Workers AI のリモート推論が必要です。
 
-1. Cloudflare に `npx wrangler login` でログインします。初回は `npx wrangler d1 create line-reminder-bot` で D1 を作成し、`wrangler.jsonc` のローカル検証用 `database_id` を作成した D1 の ID に置き換えます。
-2. `npx wrangler d1 migrations apply DB --remote` で、`0003_notification_retries.sql` を含む未適用のマイグレーションをデプロイ先の D1 に適用します。ローカル D1 には `npx wrangler d1 migrations apply DB --local` を使います。
-3. LINE Developers の「チャネル基本設定」で取得したチャネルシークレットと、「Messaging API設定」で取得したチャネルアクセストークンを、Git 管理外の `.env.production` に `LINE_CHANNEL_SECRET` と `LINE_CHANNEL_ACCESS_TOKEN` として設定します。
-4. `npx wrangler deploy --secrets-file .env.production` で Worker と Secrets を設定します。
-5. LINE Developers で Worker の HTTPS URL に `/webhook/line` を付けて登録し、「検証」が成功したら「Webhookの利用」とグループトークへの参加をオンにします。LINE Official Account Manager の応答メッセージをオフにして Bot をテスト用グループへ招待し、メニュー操作と 20:00 JST の通知を確認します。運用前に LINE の月間メッセージ通数も確認してください。
+## 設定と本番反映
+
+- `wrangler.jsonc` の `ai.binding` は `AI`、`vars.AI_MODEL` の初期値は `@cf/qwen/qwen3-30b-a3b-fp8` です。日本語と JSON 出力をサポートする Workers AI モデルを指定してください。Workers AI バインディングはアカウントに紐づき、専用の API キーを Worker に置く必要はありません。ローカルで実推論を試す場合は Workers AI を利用できるアカウントで `npx.cmd wrangler login` してください。[モデル仕様](https://developers.cloudflare.com/workers-ai/models/qwen3-30b-a3b-fp8/)
+- 承認後、`wrangler.jsonc` の D1 ID を実際のものに置き換え、`npx.cmd wrangler d1 migrations apply DB --remote` で `0004` を含む未適用分を適用します。既存のタスク・送信履歴は保持されます。新バージョンで旧2本の Cron が無効になり、毎分 Cron が有効になったことを確認します。移行前に旧方式で同日の前日通知が受理されたか不明な場合も、重複防止のため同じ前日20時の枠をスキップします。
+- LINE Secrets を Git 管理外の `.env.production` に設定して `npx.cmd wrangler deploy --secrets-file .env.production` で手動反映します。テストグループで登録・通知・引用返信を確認後、家族グループで使います。通知の通数は LINE のプラン、推論は Workers AI の利用量に応じます。[LINE の料金](https://developers.line.biz/ja/docs/messaging-api/pricing/) · [Workers AI 料金](https://developers.cloudflare.com/workers-ai/platform/pricing/)
