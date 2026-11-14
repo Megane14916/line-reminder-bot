@@ -17,6 +17,8 @@ npm run dev
 
 ヘルスチェックとテストは環境変数なしで動きます。LINE 連携時は `.dev.vars.example` を `.dev.vars` にコピーし、`LINE_CHANNEL_SECRET` と `LINE_CHANNEL_ACCESS_TOKEN` を設定します。`.dev.vars` は Git 管理対象外です。
 
+Webhook のパスは `POST /webhook/line` です。テスト用の LINE グループで Bot にメンションを送ると、操作メニューが表示されます。各ボタンは案内メッセージを返します。
+
 ## 検証
 
 ```powershell
