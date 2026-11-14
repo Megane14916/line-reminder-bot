@@ -5,8 +5,8 @@
     "moduleResolution": "Bundler",
     "strict": true,
     "skipLibCheck": true,
-    "lib": ["ESNext", "WebWorker"],
-    "types": []
+    "lib": ["ESNext"],
+    "types": ["./.wrangler/worker-configuration.d.ts"]
   },
-  "include": ["src", "tests", "worker-configuration.d.ts"]
+  "include": ["src", "tests"]
 }

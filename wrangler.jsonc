@@ -3,6 +3,13 @@
   "name": "line-reminder-bot",
   "main": "src/index.ts",
   "compatibility_date": "2026-11-14",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "line-reminder-bot",
+      "database_id": "00000000-0000-0000-0000-000000000003"
+    }
+  ],
   "secrets": {
     "required": ["LINE_CHANNEL_SECRET", "LINE_CHANNEL_ACCESS_TOKEN"]
   }
