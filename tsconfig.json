@@ -8,5 +8,5 @@
     "lib": ["ESNext", "WebWorker"],
     "types": []
   },
-  "include": ["src", "tests"]
+  "include": ["src", "tests", "worker-configuration.d.ts"]
 }
