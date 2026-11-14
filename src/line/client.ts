@@ -1,6 +1,6 @@
 import type { ReplyMessage } from './messages'
 
-export async function sendReply(accessToken: string, replyToken: string, message: ReplyMessage) {
+export async function sendReply(accessToken: string, replyToken: string, messages: ReplyMessage[]) {
   try {
     const response = await fetch('https://api.line.me/v2/bot/message/reply', {
       method: 'POST',
@@ -8,7 +8,7 @@ export async function sendReply(accessToken: string, replyToken: string, message
         Authorization: `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ replyToken, messages: [message] }),
+      body: JSON.stringify({ replyToken, messages }),
     })
 
     if (!response.ok) console.error('LINE Reply API returned HTTP', response.status)

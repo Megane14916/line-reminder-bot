@@ -8,6 +8,7 @@ Node.js 24 LTS と npm を用意し、PowerShell で実行します。
 
 ```powershell
 npm ci
+npx wrangler d1 migrations apply DB --local
 npm run dev
 ```
 
@@ -17,7 +18,13 @@ npm run dev
 
 ヘルスチェックとテストは環境変数なしで動きます。LINE 連携時は `.dev.vars.example` を `.dev.vars` にコピーし、`LINE_CHANNEL_SECRET` と `LINE_CHANNEL_ACCESS_TOKEN` を設定します。`.dev.vars` は Git 管理対象外です。
 
-Webhook のパスは `POST /webhook/line` です。テスト用の LINE グループで Bot にメンションを送ると、操作メニューが表示されます。各ボタンは案内メッセージを返します。
+Webhook のパスは `POST /webhook/line` です。テスト用の LINE グループで Bot にメンションを送って操作メニューを開きます。
+
+1. 「期限を追加」または「持ち物を追加」を押し、`11/20 水筒` や `2030-11-20 遠足の同意書` の形式で送ります。
+2. 確認メッセージの「登録する」を押します。入力と確認の有効期限はそれぞれ10分です。
+3. 「一覧を見る」で未完了のタスクを表示します。「完了」はその場で確定し、「削除」は確認ボタンを押すと確定します。
+
+`wrangler.jsonc` の D1 ID はローカル検証用です。デプロイ時は実際の D1 の ID に置き換えます。
 
 ## 検証
 

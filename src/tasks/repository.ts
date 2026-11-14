@@ -106,8 +106,12 @@ export async function applyEvent(db: D1Database, event: TaskEvent, ...changes: D
     const [, ...results] = await db.batch([record, ...changes])
     return results
   } catch (error) {
-    const processed = await db.prepare('SELECT event_id FROM processed_events WHERE event_id = ?')
-      .bind(event.eventId).first('event_id')
-    if (processed === null) throw error
+    if (!await wasProcessed(db, event.eventId)) throw error
   }
+}
+
+export async function wasProcessed(db: D1Database, eventId: string) {
+  const record = await db.prepare('SELECT event_id FROM processed_events WHERE event_id = ?')
+    .bind(eventId).first('event_id')
+  return record !== null
 }

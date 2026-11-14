@@ -1,6 +1,7 @@
 import { Hono } from 'hono'
+import { dispatchAction, type TaskAction } from '../tasks/actions'
 import { sendReply } from './client'
-import { createMenuMessage, createPostbackMessage } from './messages'
+import { createActionMessages, createMenuMessage, helpMessage, parsePostback } from './messages'
 
 export const lineWebhook = new Hono<{ Bindings: Env }>()
 
@@ -28,22 +29,34 @@ lineWebhook.post('/', async (c) => {
 
   if (!isRecord(payload) || !Array.isArray(payload.events)) return c.text('Bad Request', 400)
 
-  const replies = payload.events.flatMap((event: unknown) => {
-    const reply = getReply(event)
-    return reply ? [reply] : []
+  const events = payload.events.flatMap((event: unknown) => {
+    const operation = getOperation(event)
+    return operation ? [operation] : []
   })
-  if (replies.length) {
-    const accessToken = c.env.LINE_CHANNEL_ACCESS_TOKEN
-    if (!accessToken) {
-      console.error('LINE channel access token is not configured')
-      return c.text('Service Unavailable', 503)
-    }
+  if (!events.length) return c.body(null, 200)
 
-    c.executionCtx.waitUntil(Promise.all(replies.map(({ token, message }) =>
-      sendReply(accessToken, token, message),
-    )))
+  const { DB, LINE_CHANNEL_ACCESS_TOKEN: accessToken } = c.env
+  if (!accessToken) {
+    console.error('LINE channel access token is not configured')
+    return c.text('Service Unavailable', 503)
   }
 
+  const replies: Promise<void>[] = []
+  let failed = false
+  for (const event of events) {
+    try {
+      const messages = await getMessages(DB, event)
+      if (messages.length) replies.push(sendReply(accessToken, event.replyToken, messages))
+    } catch {
+      console.error('LINE task action failed', event.action.type)
+      failed = true
+      // Preserve the order of state transitions for events in this delivery.
+      break
+    }
+  }
+
+  if (replies.length) c.executionCtx.waitUntil(Promise.all(replies))
+  if (failed) return c.text('Service Unavailable', 503)
   return c.body(null, 200)
 })
 
@@ -55,25 +68,49 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0
 }
 
-function getReply(event: unknown) {
+type Operation = {
+  replyToken: string
+  groupId: string
+  userId: unknown
+  eventId: unknown
+  eventTime: unknown
+  action: TaskAction | { type: 'menu' } | { type: 'help' }
+}
+
+function getOperation(event: unknown): Operation | undefined {
   if (!isRecord(event) || event.mode === 'standby' || !isNonEmptyString(event.replyToken)) return
 
-  const { source, replyToken: token } = event
+  const { source, replyToken } = event
   if (!isRecord(source) || source.type !== 'group' || !isNonEmptyString(source.groupId)) return
 
+  const context = { replyToken, groupId: source.groupId, userId: source.userId,
+    eventId: event.webhookEventId, eventTime: event.timestamp }
   if (event.type === 'postback' && isNonEmptyString(source.userId) && isRecord(event.postback)) {
-    const message = createPostbackMessage(event.postback.data)
-    if (message) return { token, message }
+    const action = parsePostback(event.postback.data)
+    if (action) return { ...context, action }
   }
 
   if (event.type === 'message' && isRecord(event.message) &&
       event.message.type === 'text' && typeof event.message.text === 'string') {
     const { mention } = event.message
-    if (isRecord(mention) && Array.isArray(mention.mentionees) &&
-        mention.mentionees.some((mentionee: unknown) => isRecord(mentionee) && mentionee.isSelf === true)) {
-      return { token, message: createMenuMessage() }
+    if (isRecord(mention) && Array.isArray(mention.mentionees) && mention.mentionees.length) {
+      if (mention.mentionees.some((mentionee: unknown) => isRecord(mentionee) && mentionee.isSelf === true)) {
+        return { ...context, action: { type: 'menu' } }
+      }
+      return
     }
+    if (isNonEmptyString(source.userId)) return { ...context, action: { type: 'submit_input', text: event.message.text } }
   }
+}
+
+async function getMessages(db: D1Database, { action, groupId, userId, eventId, eventTime }: Operation) {
+  if (action.type === 'menu') return [createMenuMessage()]
+  if (action.type === 'help') return [helpMessage]
+  if (!isNonEmptyString(userId) || !isNonEmptyString(eventId) ||
+      typeof eventTime !== 'number' || !Number.isSafeInteger(eventTime)) return []
+
+  const result = await dispatchAction(db, { groupId, userId, eventId, eventTime, now: Date.now() }, action)
+  return result ? createActionMessages(result) : []
 }
 
 async function verifySignature(secret: string, header: string, body: ArrayBuffer) {

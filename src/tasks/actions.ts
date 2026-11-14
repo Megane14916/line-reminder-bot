@@ -1,6 +1,6 @@
 import {
   applyEvent, completeTask, confirmDraft, consumeSession, deleteTask, findOpenTask,
-  getSession, insertTask, listTasks, startSession,
+  getSession, insertTask, listTasks, startSession, wasProcessed,
   type Task, type TaskCategory, type TaskDraft, type TaskEvent,
 } from './repository'
 import { parseTaskInput, todayInJapan } from './validation'
@@ -74,7 +74,10 @@ export async function dispatchAction(db: D1Database, event: TaskEvent, action: T
 
 async function confirmAction(db: D1Database, event: TaskEvent, token: string) {
   const session = await getSession(db, event)
-  if (!session || session.token !== token || session.state === 'awaiting_input') return textResult(expired)
+  if (!session || session.token !== token || session.state === 'awaiting_input') {
+    if (!await wasProcessed(db, event.eventId)) return textResult(expired)
+    return
+  }
 
   const consume = consumeSession(db, event, token)
   if (session.state === 'confirm_create' && session.payload.dueDate < todayInJapan(event.now)) {
