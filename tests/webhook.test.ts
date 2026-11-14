@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeAll, expect, test, vi } from 'vitest'
 import { getPlatformProxy, unstable_splitSqlQuery, type PlatformProxy } from 'wrangler'
 import migration from '../migrations/0001_init.sql?raw'
-import app from '../src/index'
+import { app } from '../src/index'
 
 // LINE's published signature verification example.
 const bindings = {
@@ -103,10 +103,11 @@ test.each(['@家族Bot  ', '@家族Bot 明日の持ち物を教えて'])('replie
   expect(fetchMock).toHaveBeenCalledTimes(1)
   const [url, request] = fetchMock.mock.calls[0]
   expect(url).toBe('https://api.line.me/v2/bot/message/reply')
-  expect(request).toMatchObject({
-    method: 'POST',
-    headers: { Authorization: 'Bearer test-access-token', 'Content-Type': 'application/json' },
-  })
+  expect(request?.method).toBe('POST')
+  const headers = new Headers(request?.headers)
+  expect(headers.get('Authorization')).toBe('Bearer test-access-token')
+  expect(headers.get('Content-Type')).toBe('application/json')
+  expect(headers.has('X-Line-Retry-Key')).toBe(false)
   expect(JSON.parse(String(request?.body))).toMatchObject({
     replyToken: 'test-reply-token',
     messages: [{
