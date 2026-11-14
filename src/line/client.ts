@@ -2,8 +2,10 @@ import type { ReplyMessage } from './messages'
 
 type SendResult =
   | { ok: true }
-  | { ok: false; kind: 'http'; status: number }
-  | { ok: false; kind: 'network' }
+  | { ok: false; kind: 'http'; status: number; retryAfter?: string }
+  | { ok: false; kind: 'network' | 'timeout' }
+
+export const pushTimeoutMs = 10_000
 
 export function sendReply(accessToken: string, replyToken: string, messages: ReplyMessage[]) {
   return postMessage('reply', accessToken, JSON.stringify({ replyToken, messages }))
@@ -21,17 +23,19 @@ async function postMessage(endpoint: 'reply' | 'push', accessToken: string, body
   })
   if (retryKey) headers.set('X-Line-Retry-Key', retryKey)
 
+  const signal = endpoint === 'push' ? AbortSignal.timeout(pushTimeoutMs) : undefined
   let response: Response
   try {
     response = await fetch(`https://api.line.me/v2/bot/message/${endpoint}`, {
       method: 'POST', headers, body,
-      signal: endpoint === 'push' ? AbortSignal.timeout(10_000) : undefined,
+      signal,
     })
   } catch {
-    return { ok: false, kind: 'network' }
+    return { ok: false, kind: signal?.aborted ? 'timeout' : 'network' }
   }
   if (response.ok || (retryKey && response.status === 409 && response.headers.has('X-Line-Accepted-Request-Id'))) {
     return { ok: true }
   }
-  return { ok: false, kind: 'http', status: response.status }
+  const retryAfter = endpoint === 'push' && response.status === 429 ? response.headers.get('Retry-After') : null
+  return { ok: false, kind: 'http', status: response.status, ...(retryAfter ? { retryAfter } : {}) }
 }
