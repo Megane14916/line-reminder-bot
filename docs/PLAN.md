@@ -376,7 +376,7 @@ ci: run typecheck and tests on pull requests
 
 ### GitHub Actions
 
-- PRと`main`へのpushで `npm ci`、型チェック、テストを実行。
+- PRと`main`へのpushで `npm ci`、型チェック、テスト、`npx wrangler deploy --dry-run` によるビルド検証を実行。
 - テストに本物のLINEトークンやLLMキーは不要。ダミー値・モック・ローカルD1を使う。
 - CIからの本番デプロイは初期段階では設定しない。リリースはユーザー承認後に手動。
 - 機密情報（`.dev.vars`、Cloudflare API Token、LINEトークン、AIキー）はリポジトリ・Issue・PR・ログへ載せない。
