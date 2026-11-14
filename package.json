@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "typecheck": "wrangler types .wrangler/worker-configuration.d.ts --include-main-module=false && tsc --noEmit",
+    "typecheck": "node -e \"require('node:fs').mkdirSync('.wrangler', { recursive: true })\" && wrangler types .wrangler/worker-configuration.d.ts --include-main-module=false && tsc --noEmit",
     "test": "vitest run"
   },
   "dependencies": {
