@@ -1,4 +1,6 @@
-import { afterEach, expect, test, vi } from 'vitest'
+import { afterAll, afterEach, beforeAll, expect, test, vi } from 'vitest'
+import { getPlatformProxy, unstable_splitSqlQuery, type PlatformProxy } from 'wrangler'
+import migration from '../migrations/0001_init.sql?raw'
 import app from '../src/index'
 
 // LINE's published signature verification example.
@@ -8,6 +10,13 @@ const bindings = {
 }
 const exampleBody = '{"destination":"U8e742f61d673b39c7fff3cecb7536ef0","events":[]}'
 const exampleSignature = 'GhRKmvmHys4Pi8DxkF4+EayaH0OqtJtaZxgTD9fMDLs='
+
+let platform: PlatformProxy<Env>
+beforeAll(async () => {
+  platform = await getPlatformProxy<Env>({ persist: false, remoteBindings: false, envFiles: [] })
+  await platform.env.DB.batch(unstable_splitSqlQuery(migration).map((sql) => platform.env.DB.prepare(sql)))
+}, 20_000)
+afterAll(async () => await platform?.dispose())
 
 const source = { type: 'group', groupId: 'test-group', userId: 'test-user' }
 const mentionEvent = {
@@ -28,7 +37,7 @@ function post(body: string, signature?: string, waitUntil = vi.fn()) {
     method: 'POST',
     headers: signature ? { 'x-line-signature': signature } : {},
     body,
-  }, bindings, { waitUntil, passThroughOnException: vi.fn(), props: {} })
+  }, { ...bindings, DB: platform.env.DB }, { waitUntil, passThroughOnException: vi.fn(), props: {} })
 }
 
 async function sign(body: string) {
@@ -42,7 +51,9 @@ async function sign(body: string) {
 }
 
 async function postEvents(events: unknown[]) {
-  const body = JSON.stringify({ events })
+  const body = JSON.stringify({ events: events.map((event) => ({
+    webhookEventId: crypto.randomUUID(), timestamp: Date.now(), ...event as object,
+  })) })
   const waitUntil = vi.fn<(promise: Promise<unknown>) => void>()
   const response = await post(body, await sign(body), waitUntil)
   await Promise.all(waitUntil.mock.calls.map(([promise]) => promise))
@@ -119,14 +130,14 @@ test.each(['@家族Bot  ', '@家族Bot 明日の持ち物を教えて'])('replie
 })
 
 test.each([
-  ['add_deadline', '期限の追加を選びました。'],
-  ['add_belonging', '持ち物の追加を選びました。'],
-  ['list_tasks', '一覧を選びました。'],
-  ['help', '操作メニューが開きます。'],
+  ['add_deadline', '日付とタイトルを送ってください。'],
+  ['add_belonging', '日付とタイトルを送ってください。'],
+  ['list_tasks', '未完了のタスクはありません。'],
+  ['help', '操作メニューを開きます。'],
 ])('replies to the %s postback', async (data, expectedText) => {
   const fetchMock = mockReply()
 
-  const response = await postEvents([{ ...postbackEvent, postback: { data } }])
+  const response = await postEvents([{ ...postbackEvent, source: { ...source, userId: data }, postback: { data } }])
 
   expect(response.status).toBe(200)
   expect(fetchMock).toHaveBeenCalledTimes(1)
@@ -158,20 +169,153 @@ test.each([
   expect(fetchMock).not.toHaveBeenCalled()
 })
 
-test('acknowledges a batch without waiting for Reply API responses', async () => {
+test('acknowledges a batch and settles all replies when some fail', async () => {
   const fetchMock = mockReply()
   const log = vi.spyOn(console, 'error').mockImplementation(() => {})
   let finishFirstReply!: (response: Response) => void
   fetchMock.mockImplementationOnce(() => new Promise((resolve) => { finishFirstReply = resolve }))
-  const body = JSON.stringify({ events: [mentionEvent, { ...postbackEvent, postback: { data: 'help' } }] })
+  fetchMock.mockRejectedValueOnce(new Error('private network error detail'))
+  const body = JSON.stringify({ events: [
+    { ...mentionEvent, webhookEventId: 'http-failure' },
+    { ...postbackEvent, postback: { data: 'help' }, webhookEventId: 'network-failure' },
+    { ...mentionEvent, replyToken: 'another-reply-token', webhookEventId: 'success' },
+  ] })
   const waitUntil = vi.fn<(promise: Promise<unknown>) => void>()
 
   const response = await post(body, await sign(body), waitUntil)
   expect(response.status).toBe(200)
-  expect(fetchMock).toHaveBeenCalledTimes(2)
+  expect(fetchMock).toHaveBeenCalledTimes(3)
   expect(waitUntil).toHaveBeenCalledTimes(1)
 
   finishFirstReply(new Response(null, { status: 500 }))
-  await waitUntil.mock.calls[0][0]
-  expect(log).toHaveBeenCalledWith('LINE Reply API returned HTTP', 500)
+  await expect(waitUntil.mock.calls[0][0]).resolves.toEqual([undefined, undefined, undefined])
+  expect(log.mock.calls).toEqual([
+    ['LINE reply failed', { action: 'help', eventId: 'network-failure', kind: 'network' }],
+    ['LINE reply failed', { action: 'menu', eventId: 'http-failure', kind: 'http', status: 500 }],
+  ])
+})
+
+test('keeps a committed task and does not retry its failed reply on redelivery', async () => {
+  const fetchMock = mockReply()
+  const log = vi.spyOn(console, 'error').mockImplementation(() => {})
+  const taskSource = { ...source, groupId: 'reply-failure' }
+
+  await postEvents([{ ...postbackEvent, source: taskSource, postback: { data: 'add_deadline' } }])
+  await postEvents([{ ...mentionEvent, source: taskSource, message: { type: 'text', text: '2099-11-20 遠足' } }])
+  const confirmation = JSON.parse(String(fetchMock.mock.lastCall?.[1]?.body)).messages[0]
+  const data = confirmation.contents.body.contents[1].action.data
+  const event = { ...postbackEvent, source: taskSource, postback: { data }, webhookEventId: 'failed-confirm-reply' }
+
+  fetchMock.mockClear().mockResolvedValueOnce(new Response(null, { status: 400 }))
+  expect((await postEvents([event])).status).toBe(200)
+  expect((await postEvents([event])).status).toBe(200)
+
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+  expect(log.mock.calls).toEqual([
+    ['LINE reply failed', { action: 'confirm', eventId: 'failed-confirm-reply', kind: 'http', status: 400 }],
+  ])
+  expect(await platform.env.DB.prepare('SELECT COUNT(*) AS total FROM tasks WHERE group_id = ?')
+    .bind(taskSource.groupId).first('total')).toBe(1)
+})
+
+test('ignores chat during input, keeps the session and replies to date-like errors', async () => {
+  const fetchMock = mockReply()
+  const taskSource = { ...source, groupId: 'input-filter' }
+  const message = (text: string, userId = taskSource.userId) => ({
+    ...mentionEvent, source: { ...taskSource, userId }, message: { type: 'text', text },
+  })
+  const lastReply = () => JSON.parse(String(fetchMock.mock.lastCall?.[1]?.body)).messages[0]
+  await postEvents([{ ...postbackEvent, source: taskSource, postback: { data: 'add_deadline' } }])
+
+  const session = () => platform.env.DB.prepare('SELECT * FROM interaction_sessions WHERE group_id = ? AND user_id = ?')
+    .bind(taskSource.groupId, taskSource.userId).first()
+  const waiting = await session()
+  expect(waiting).toMatchObject({ state: 'awaiting_input' })
+
+  fetchMock.mockClear()
+  await postEvents([message('今日の晩ご飯何？'), message('今日の晩ご飯何？', 'someone-else'),
+    message('2099-11-20 遠足', 'someone-else')])
+  expect(fetchMock).not.toHaveBeenCalled()
+  expect(await session()).toEqual(waiting)
+
+  await postEvents([{ ...mentionEvent, source: taskSource }])
+  expect(lastReply()).toMatchObject({ type: 'flex', altText: '家族Botの操作メニュー' })
+
+  for (const input of ['11/31 遠足', '11/20', `11/20 ${'あ'.repeat(101)}`]) {
+    await postEvents([message(input)])
+    expect(lastReply()).toMatchObject({ type: 'text', text: expect.stringContaining('日付またはタイトルを確認') })
+  }
+  expect(await session()).toEqual(waiting)
+
+  await postEvents([message('2099-11-20 遠足')])
+  expect(lastReply()).toMatchObject({ type: 'flex', altText: '登録の確認' })
+})
+
+test('runs the group task flow through signed webhooks and LINE postbacks', async () => {
+  const fetchMock = mockReply()
+  const taskSource = { ...source, groupId: 'task-flow' }
+  const text = (value: string, userId = taskSource.userId) => ({
+    ...mentionEvent, source: { ...taskSource, userId }, message: { type: 'text', text: value },
+  })
+  const press = (data: string, webhookEventId = crypto.randomUUID()) => ({
+    ...postbackEvent, source: taskSource, postback: { data }, webhookEventId,
+  })
+  const messages = () => JSON.parse(String(fetchMock.mock.lastCall?.[1]?.body)).messages
+  const date = '2099-11-20'
+
+  await postEvents([press('add_deadline')])
+  expect(messages()[0].text).toContain('日付とタイトル')
+  fetchMock.mockClear()
+  await postEvents([text(`${date} 遠足の同意書`, 'someone-else')])
+  expect(fetchMock).not.toHaveBeenCalled()
+
+  await postEvents([text(`${date} 遠足の同意書`)])
+  const create = messages()[0].contents.body.contents[1].action.data
+  const buttonEvent = press(create)
+  await postEvents([buttonEvent])
+  expect(messages()[0].text).toContain('登録しました')
+  fetchMock.mockClear()
+  await postEvents([buttonEvent])
+  expect(fetchMock).not.toHaveBeenCalled()
+
+  await postEvents([press('add_belonging'), text(`${date} 水筒`)])
+  const addBelonging = messages()[0].contents.body.contents[1].action.data
+  await postEvents([press(addBelonging)])
+  await postEvents([press('list_tasks')])
+  const list = messages()[0].contents.contents
+  expect(list).toHaveLength(2)
+  expect(list[0].body.contents[0].text).toContain('遠足の同意書')
+  expect(list[1].body.contents[0].text).toContain('水筒')
+
+  await postEvents([press(list[0].body.contents[1].action.data)])
+  expect(messages()[0].text).toContain('完了しました')
+  await postEvents([press(list[1].body.contents[2].action.data)])
+  expect(messages()[0].altText).toBe('削除の確認')
+  const remove = messages()[0].contents.body.contents[1].action.data
+  await postEvents([press('list_tasks')])
+  expect(messages()[0].contents.contents).toHaveLength(1)
+  await postEvents([press(remove)])
+  expect(messages()[0].text).toContain('削除しました')
+  await postEvents([press('list_tasks')])
+  expect(messages()[0].text).toContain('未完了のタスクはありません')
+})
+
+test('returns a retryable response when D1 fails to process an event', async () => {
+  const fetchMock = mockReply()
+  const log = vi.spyOn(console, 'error').mockImplementation(() => {})
+  const body = JSON.stringify({ events: [{
+    ...postbackEvent, postback: { data: 'add_deadline' }, webhookEventId: 'retryable', timestamp: Date.now(),
+    source: { ...source, groupId: 'simulate-db-failure' },
+  }] })
+  const db = platform.env.DB
+  await db.prepare(`CREATE TRIGGER fail_session_insert BEFORE INSERT ON interaction_sessions
+    WHEN NEW.group_id = 'simulate-db-failure' BEGIN SELECT RAISE(ABORT, 'test D1 error'); END`).run()
+
+  const response = await post(body, await sign(body))
+
+  expect(response.status).toBe(503)
+  expect(fetchMock).not.toHaveBeenCalled()
+  expect(log).toHaveBeenCalledWith('LINE task action failed', 'start_create')
+  expect(await db.prepare('SELECT event_id FROM processed_events WHERE event_id = ?').bind('retryable').first())
+    .toBeNull()
 })
