@@ -218,6 +218,39 @@ test('keeps a committed task and does not retry its failed reply on redelivery',
     .bind(taskSource.groupId).first('total')).toBe(1)
 })
 
+test('ignores chat during input, keeps the session and replies to date-like errors', async () => {
+  const fetchMock = mockReply()
+  const taskSource = { ...source, groupId: 'input-filter' }
+  const message = (text: string, userId = taskSource.userId) => ({
+    ...mentionEvent, source: { ...taskSource, userId }, message: { type: 'text', text },
+  })
+  const lastReply = () => JSON.parse(String(fetchMock.mock.lastCall?.[1]?.body)).messages[0]
+  await postEvents([{ ...postbackEvent, source: taskSource, postback: { data: 'add_deadline' } }])
+
+  const session = () => platform.env.DB.prepare('SELECT * FROM interaction_sessions WHERE group_id = ? AND user_id = ?')
+    .bind(taskSource.groupId, taskSource.userId).first()
+  const waiting = await session()
+  expect(waiting).toMatchObject({ state: 'awaiting_input' })
+
+  fetchMock.mockClear()
+  await postEvents([message('今日の晩ご飯何？'), message('今日の晩ご飯何？', 'someone-else'),
+    message('2099-11-20 遠足', 'someone-else')])
+  expect(fetchMock).not.toHaveBeenCalled()
+  expect(await session()).toEqual(waiting)
+
+  await postEvents([{ ...mentionEvent, source: taskSource }])
+  expect(lastReply()).toMatchObject({ type: 'flex', altText: '家族Botの操作メニュー' })
+
+  for (const input of ['11/31 遠足', '11/20', `11/20 ${'あ'.repeat(101)}`]) {
+    await postEvents([message(input)])
+    expect(lastReply()).toMatchObject({ type: 'text', text: expect.stringContaining('日付またはタイトルを確認') })
+  }
+  expect(await session()).toEqual(waiting)
+
+  await postEvents([message('2099-11-20 遠足')])
+  expect(lastReply()).toMatchObject({ type: 'flex', altText: '登録の確認' })
+})
+
 test('runs the group task flow through signed webhooks and LINE postbacks', async () => {
   const fetchMock = mockReply()
   const taskSource = { ...source, groupId: 'task-flow' }

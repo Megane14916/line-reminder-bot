@@ -1,7 +1,15 @@
 import { expect, test } from 'vitest'
-import { parseTaskInput } from '../src/tasks/validation'
+import { looksLikeTaskInput, parseTaskInput } from '../src/tasks/validation'
 
 const newYear = Date.parse('2030-12-31T15:00:00Z') // 2031-01-01 in Japan.
+
+test.each(['今日の晩ご飯何？', '遠足は 11/20 に決まった', '11月20日は空いてる？', ''])('ignores chat text %j', (text) => {
+  expect(looksLikeTaskInput(text)).toBe(false)
+})
+
+test.each(['  1/1 水筒', '2031-01-02 遠足', '11/31 遠足', '2031-2-3 同意書', '11/20'])('recognizes a date-like input %j', (text) => {
+  expect(looksLikeTaskInput(text)).toBe(true)
+})
 
 test.each([
   ['1/1 水筒', newYear, '2031-01-01', '水筒'],

@@ -6,6 +6,11 @@ export function todayInJapan(now: number) {
   return jstDate.format(now)
 }
 
+// Recognize a date at the start before validating its calendar value or title.
+export function looksLikeTaskInput(text: string) {
+  return /^(?:\d{4}-\d{1,2}-\d{1,2}|\d{1,2}\/\d{1,2})(?=\s|$)/.test(text.trimStart())
+}
+
 export function parseTaskInput(text: string, now: number) {
   const input = /^(\S+)\s+([\s\S]+)$/.exec(text.trim())
   if (!input) return

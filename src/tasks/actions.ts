@@ -3,7 +3,7 @@ import {
   getSession, insertTask, listTasks, startSession, wasProcessed,
   type Task, type TaskCategory, type TaskDraft, type TaskEvent,
 } from './repository'
-import { parseTaskInput, todayInJapan } from './validation'
+import { looksLikeTaskInput, parseTaskInput, todayInJapan } from './validation'
 
 export type TaskAction =
   | { type: 'start_create'; category: TaskCategory }
@@ -40,6 +40,8 @@ export async function dispatchAction(db: D1Database, event: TaskEvent, action: T
       return
     }
     case 'submit_input': {
+      if (!looksLikeTaskInput(action.text)) return
+
       const session = await getSession(db, event)
       if (session?.state !== 'awaiting_input') return
 
