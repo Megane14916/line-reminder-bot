@@ -180,8 +180,9 @@ type TaskAction =
 
 - 毎日**20:00 JST**、翌日が期限の未完了タスクを`groupId`ごとにまとめて1通のPushメッセージで送る。
 - 対象がないグループには送らない。20時を過ぎて翌日期限タスクを登録した場合、その日分の前日通知には追加しない（MVP仕様）。
-- Cron Triggerは `0 11 * * *`（UTC）。同じグループ・対象日への二重配信を防ぐ通知記録を持つ。
-- LINEのRetry Keyと送信本文は初回送信前に保存。再試行するなら**同じ本文・同じキー**を使い、24時間を超えて再利用しない。最初は自動再試行なしでよい（失敗はログとDBに記録）。
+- 初回通知の Cron Trigger は `0 11 * * *`（UTC）。再試行用の `*/5 * * * *` は保存済み通知だけを処理する。
+- LINEのRetry Keyと送信本文を初回送信前に保存し、D1の条件付き更新でグループ・対象日ごとの送信権を2分間取得する。HTTP 5xx、通信失敗、タイムアウト、HTTP 429、結果不明の中断は、保存した本文とキーで再試行する。HTTP 429は最低15分待ち、`Retry-After`も尊重する。
+- 自動試行は初回を含めて最大4回、通知の保存から24時間以内。恒久的なHTTP 4xxは自動再試行の対象外とし、LINEの受理済みを示す409は成功として記録する。ログとD1に試行結果を残す。LINEのキーによる重複防止はリクエスト受理に適用され、端末への到達は保証されない。
 - LINEの月間メッセージ通数はグループ人数等に影響される。運用前にプランの残量を確認し、通知頻度を無闇に増やさない。
 
 ## 6. D1データモデル
@@ -193,7 +194,7 @@ SQLマイグレーションで以下を定義する。必要に応じて最小�
 | `tasks` | `id` (PK), `group_id`, `category`, `title`, `due_date`, `status`, `created_by`, `created_at`, `completed_at` | 家族グループ単位の期限・持ち物管理 |
 | `interaction_sessions` | `group_id`, `user_id`, `state`, `payload_json`, `expires_at`, `updated_at` | 「追加入力待ち」「候補選択待ち」「確定待ち」を管理。`(group_id, user_id)`をPK |
 | `processed_events` | `event_id` (PK), `processed_at` | LINE Webhook再配信の重複抑止 |
-| `notification_batches` | `group_id`, `target_due_date`, `message_text`, `retry_key`, `status`, `sent_at`, `created_at` | まとめ通知と二重配信抑止。`(group_id, target_due_date)`で一意 |
+| `notification_batches` | `group_id`, `target_due_date`, `message_text`, `retry_key`, `status`, `http_status`, `sent_at`, `created_at`, `attempt_count`, `last_attempt_at`, `lease_until`, `next_attempt_at`, `last_error_kind` | まとめ通知、試行記録、二重配信抑止。`(group_id, target_due_date)`で一意 |
 
 - `tasks.status` は `open` / `done`。削除はMVPでは物理削除でよい。
 - `tasks(group_id, status, due_date)` にインデックス。DBアクセスは常に `prepare().bind()` 等のパラメータ付きSQL。
