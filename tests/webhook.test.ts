@@ -169,22 +169,53 @@ test.each([
   expect(fetchMock).not.toHaveBeenCalled()
 })
 
-test('acknowledges a batch without waiting for Reply API responses', async () => {
+test('acknowledges a batch and settles all replies when some fail', async () => {
   const fetchMock = mockReply()
   const log = vi.spyOn(console, 'error').mockImplementation(() => {})
   let finishFirstReply!: (response: Response) => void
   fetchMock.mockImplementationOnce(() => new Promise((resolve) => { finishFirstReply = resolve }))
-  const body = JSON.stringify({ events: [mentionEvent, { ...postbackEvent, postback: { data: 'help' } }] })
+  fetchMock.mockRejectedValueOnce(new Error('private network error detail'))
+  const body = JSON.stringify({ events: [
+    { ...mentionEvent, webhookEventId: 'http-failure' },
+    { ...postbackEvent, postback: { data: 'help' }, webhookEventId: 'network-failure' },
+    { ...mentionEvent, replyToken: 'another-reply-token', webhookEventId: 'success' },
+  ] })
   const waitUntil = vi.fn<(promise: Promise<unknown>) => void>()
 
   const response = await post(body, await sign(body), waitUntil)
   expect(response.status).toBe(200)
-  expect(fetchMock).toHaveBeenCalledTimes(2)
+  expect(fetchMock).toHaveBeenCalledTimes(3)
   expect(waitUntil).toHaveBeenCalledTimes(1)
 
   finishFirstReply(new Response(null, { status: 500 }))
-  await waitUntil.mock.calls[0][0]
-  expect(log).toHaveBeenCalledWith('LINE Reply API returned HTTP', 500)
+  await expect(waitUntil.mock.calls[0][0]).resolves.toEqual([undefined, undefined, undefined])
+  expect(log.mock.calls).toEqual([
+    ['LINE reply failed', { action: 'help', eventId: 'network-failure', kind: 'network' }],
+    ['LINE reply failed', { action: 'menu', eventId: 'http-failure', kind: 'http', status: 500 }],
+  ])
+})
+
+test('keeps a committed task and does not retry its failed reply on redelivery', async () => {
+  const fetchMock = mockReply()
+  const log = vi.spyOn(console, 'error').mockImplementation(() => {})
+  const taskSource = { ...source, groupId: 'reply-failure' }
+
+  await postEvents([{ ...postbackEvent, source: taskSource, postback: { data: 'add_deadline' } }])
+  await postEvents([{ ...mentionEvent, source: taskSource, message: { type: 'text', text: '2099-11-20 遠足' } }])
+  const confirmation = JSON.parse(String(fetchMock.mock.lastCall?.[1]?.body)).messages[0]
+  const data = confirmation.contents.body.contents[1].action.data
+  const event = { ...postbackEvent, source: taskSource, postback: { data }, webhookEventId: 'failed-confirm-reply' }
+
+  fetchMock.mockClear().mockResolvedValueOnce(new Response(null, { status: 400 }))
+  expect((await postEvents([event])).status).toBe(200)
+  expect((await postEvents([event])).status).toBe(200)
+
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+  expect(log.mock.calls).toEqual([
+    ['LINE reply failed', { action: 'confirm', eventId: 'failed-confirm-reply', kind: 'http', status: 400 }],
+  ])
+  expect(await platform.env.DB.prepare('SELECT COUNT(*) AS total FROM tasks WHERE group_id = ?')
+    .bind(taskSource.groupId).first('total')).toBe(1)
 })
 
 test('runs the group task flow through signed webhooks and LINE postbacks', async () => {

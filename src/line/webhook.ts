@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import { dispatchAction, type TaskAction } from '../tasks/actions'
 import { sendReply } from './client'
-import { createActionMessages, createMenuMessage, helpMessage, parsePostback } from './messages'
+import { createActionMessages, createMenuMessage, helpMessage, parsePostback, type ReplyMessage } from './messages'
 
 export const lineWebhook = new Hono<{ Bindings: Env }>()
 
@@ -46,7 +46,7 @@ lineWebhook.post('/', async (c) => {
   for (const event of events) {
     try {
       const messages = await getMessages(DB, event)
-      if (messages.length) replies.push(sendReply(accessToken, event.replyToken, messages))
+      if (messages.length) replies.push(deliverReply(accessToken, event, messages))
     } catch {
       console.error('LINE task action failed', event.action.type)
       failed = true
@@ -75,6 +75,22 @@ type Operation = {
   eventId: unknown
   eventTime: unknown
   action: TaskAction | { type: 'menu' } | { type: 'help' }
+}
+
+async function deliverReply(accessToken: string, event: Operation, messages: ReplyMessage[]) {
+  const context = {
+    action: event.action.type,
+    eventId: isNonEmptyString(event.eventId) ? event.eventId : undefined,
+  }
+  try {
+    const result = await sendReply(accessToken, event.replyToken, messages)
+    if (!result.ok) {
+      const status = result.kind === 'http' ? { status: result.status } : {}
+      console.error('LINE reply failed', { ...context, kind: result.kind, ...status })
+    }
+  } catch {
+    console.error('LINE reply failed', { ...context, kind: 'unexpected' })
+  }
 }
 
 function getOperation(event: unknown): Operation | undefined {
