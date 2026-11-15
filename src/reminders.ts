@@ -1,4 +1,5 @@
-import { pushTimeoutMs, sendPush } from './line/client'
+import { pushTimeoutMs, retryDelay, sendPush } from './line/client'
+import { lineTimeout, runtimeBudget, type RuntimeBudget } from './runtime-budget'
 import { reminderSlots, ruleSchema } from './tasks/schedule'
 import { daysUntil, todayInJapan } from './tasks/validation'
 
@@ -23,13 +24,16 @@ function earliestSlot(now: number) {
   return Math.max(now + pushTimeoutMs - freshness + 1, midnight)
 }
 
-export async function runReminders({ DB, LINE_CHANNEL_ACCESS_TOKEN: accessToken }: Env, clock = Date.now) {
+export async function runReminders(env: Env, clock = Date.now, budget = runtimeBudget(clock)) {
+  const { DB, LINE_CHANNEL_ACCESS_TOKEN: accessToken } = env
+  if (budget.remaining() <= 1000) return
   const now = clock()
   const { results: tasks } = await DB.prepare(`SELECT id, group_id, title, due_date, reminder_rule, reminder_anchor,
     reminder_version, next_reminder_at FROM tasks WHERE status = 'open' AND deleted_at IS NULL AND reminder_enabled = 1
     AND next_reminder_at <= ? ORDER BY next_reminder_at, id LIMIT ?`).bind(now, scanLimit).all<ScheduledTask>()
 
   for (const task of tasks) {
+    if (budget.remaining() <= 1000) return
     try {
       await enqueue(DB, task, clock())
     } catch {
@@ -37,6 +41,7 @@ export async function runReminders({ DB, LINE_CHANNEL_ACCESS_TOKEN: accessToken 
     }
   }
 
+  if (budget.remaining() <= 1000) return
   const readyAt = clock()
   const { results } = await DB.prepare(`SELECT o.task_id, o.scheduled_at, o.group_id FROM reminder_occurrences o
     JOIN tasks t ON t.id = o.task_id AND t.group_id = o.group_id AND t.reminder_version = o.rule_version
@@ -48,8 +53,9 @@ export async function runReminders({ DB, LINE_CHANNEL_ACCESS_TOKEN: accessToken 
     .bind(earliestSlot(readyAt), readyAt, maxAttempts, readyAt, readyAt, sendLimit).all<Occurrence>()
   if (results.length && !accessToken) throw new Error('LINE channel access token is not configured')
   for (const occurrence of results) {
+    if (budget.remaining() <= 2000) return
     try {
-      await deliver(DB, accessToken, occurrence, clock)
+      await deliver(DB, accessToken, occurrence, budget, lineTimeout(env))
     } catch {
       console.error('Reminder task failed', { stage: 'delivery', taskId: occurrence.task_id, scheduledAt: occurrence.scheduled_at })
     }
@@ -83,7 +89,8 @@ async function enqueue(db: D1Database, task: ScheduledTask, now: number) {
   await db.batch([insert, advance])
 }
 
-async function deliver(db: D1Database, accessToken: string, occurrence: Occurrence, clock: () => number) {
+async function deliver(db: D1Database, accessToken: string, occurrence: Occurrence, budget: RuntimeBudget, lineLimit: number) {
+  const { clock } = budget
   const { task_id: id, scheduled_at: slot, group_id: group } = occurrence
   const now = clock()
   const claim = await db.prepare(`UPDATE reminder_occurrences AS o SET status = 'pending', attempt_count = attempt_count + 1,
@@ -96,9 +103,11 @@ async function deliver(db: D1Database, accessToken: string, occurrence: Occurren
     .bind(now, now + leaseMs, id, slot, group, earliestSlot(now), now, maxAttempts, now, now).first<Claim>()
   if (!claim) return
   const sendAt = clock()
-  if (sendAt + pushTimeoutMs >= claim.lease_until || slot < earliestSlot(sendAt)) return
+  const timeout = Math.min(lineLimit, budget.remaining() - 1000)
+  if (timeout <= 0 || sendAt + timeout >= claim.lease_until || slot < earliestSlot(sendAt)) return
 
-  const result = await sendPush(accessToken, group, claim.message_text, claim.retry_key)
+  const result = await sendPush(accessToken, group, claim.message_text, claim.retry_key, timeout)
+  if (budget.remaining() <= 0) return
   const completedAt = clock()
   const status = !result.ok && result.kind === 'http' ? result.status : null
   const next = result.ok ? null : retryAt(result, completedAt, slot, claim.attempt_count)
@@ -113,14 +122,8 @@ async function deliver(db: D1Database, accessToken: string, occurrence: Occurren
 
 function retryAt(result: Extract<Awaited<ReturnType<typeof sendPush>>, { ok: false }>, now: number, slot: number, attempt: number) {
   if (attempt >= maxAttempts) return null
-  let delay = 5 * minute * 2 ** (attempt - 1)
-  if (result.kind === 'http') {
-    if (result.status === 429) {
-      const after = result.retryAfter?.trim() ?? ''
-      const requested = /^\d+$/.test(after) ? Number(after) * 1000 : Date.parse(after) - now
-      delay = Math.max(delay, 15 * minute, Number.isNaN(requested) ? 0 : requested)
-    } else if (result.status < 500 || result.status >= 600) return null
-  }
+  const delay = retryDelay(result, now, 5 * minute * 2 ** (attempt - 1))
+  if (delay === null) return null
   const next = now + delay
   return slot >= earliestSlot(next) ? next : null
 }

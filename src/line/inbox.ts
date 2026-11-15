@@ -1,14 +1,15 @@
 import { intentSchema, type TaskAction } from '../tasks/intent'
 import { answerSelection, clarify, dispatchAction, help } from '../tasks/actions'
 import { finishInboxEvent, getQuotedTask, wasProcessed, type TaskEvent } from '../tasks/repository'
-import { sendReply } from './client'
-import { inferenceTimeoutMs, parseIntent } from './intent-parser'
+import { aiTimeout, runtimeBudget, type RuntimeBudget } from '../runtime-budget'
+import { parseIntent } from './intent-parser'
+import { drainResults, expiredOperationResults, failedInference, unknownOperation } from './outbox'
 
 export type Input = { type: 'intent'; text: string } | { type: 'quote'; messageId: string } | { type: 'selection'; id: number }
 export type Operation = Omit<TaskEvent, 'now' | 'inbox'> & { replyToken: string; input: Input }
 type Entry = { receipt_id: number; group_id: string }
 type Claimed = Entry & {
-  event_id: string; user_id: string; event_time: number; received_at: number; reply_token: string
+  event_id: string; user_id: string; event_time: number; received_at: number
   input_json: string; action_json: string | null; attempts: number
 }
 type InboxEvent = TaskEvent & { inbox: NonNullable<TaskEvent['inbox']> }
@@ -16,7 +17,6 @@ type InboxEvent = TaskEvent & { inbox: NonNullable<TaskEvent['inbox']> }
 const maxAttempts = 3
 const retention = 15 * 60_000
 const leaseMs = 45_000
-const budgetMs = 25_000
 const groupLimit = 4
 const perGroupLimit = 2
 const intakeBatch = 25
@@ -39,64 +39,65 @@ const unlocked = `NOT EXISTS (SELECT 1 FROM webhook_inbox active WHERE active.gr
 const ready = `q.status IN ('queued', 'running') AND q.available_at <= ?
   AND (q.lease_until IS NULL OR q.lease_until <= ?) AND q.attempts < ? AND q.received_at > ?`
 
-export async function drainInbox(env: Env, clock = Date.now) {
+export async function drainInbox(env: Env, budget = runtimeBudget()) {
   const db = env.DB
+  const { clock } = budget
   const start = clock()
-  const deadline = start + budgetMs
-  // Terminalize an abandoned last attempt or an expired queue entry, keeping only metadata.
-  await db.prepare(`UPDATE webhook_inbox SET status = 'failed', last_error = CASE
+  if (budget.remaining() <= 1000) return
+  const expired = `SELECT receipt_id FROM webhook_inbox WHERE status IN ('queued', 'running')
+    AND (received_at <= ? OR attempts >= ?) AND (lease_until IS NULL OR lease_until <= ?) ORDER BY receipt_id LIMIT 25`
+  const expiry = [start - retention, maxAttempts, start]
+  await db.batch([expiredOperationResults(db, expired, start, expiry), db.prepare(`UPDATE webhook_inbox SET status = 'failed', last_error = CASE
       WHEN received_at <= ? THEN 'expired' ELSE COALESCE(last_error, 'abandoned') END,
     finished_at = ?, input_json = NULL, action_json = NULL, reply_token = NULL, lease_token = NULL, lease_until = NULL
-    WHERE receipt_id IN (SELECT receipt_id FROM webhook_inbox WHERE status IN ('queued', 'running')
-      AND (received_at <= ? OR attempts >= ?) AND (lease_until IS NULL OR lease_until <= ?) LIMIT 25)`)
-    .bind(start - retention, start, start - retention, maxAttempts, start).run()
+    WHERE receipt_id IN (${expired})`).bind(start - retention, start, ...expiry)])
 
+  if (budget.remaining() <= 1000) return
   const { results } = await db.prepare(`SELECT q.receipt_id, q.group_id FROM webhook_inbox q
     WHERE ${ready} AND ${head} AND ${unlocked} ORDER BY q.available_at, q.receipt_id LIMIT ?`)
     .bind(start, start, maxAttempts, start - retention, start, groupLimit).all<Entry>()
 
-  const replies: Promise<void>[] = []
+  const deliveries: Promise<void>[] = []
   await Promise.all(results.map(async (entry) => {
     try {
       for (let i = 0; i < perGroupLimit; i++) {
         const now = clock()
-        if (deadline - now < inferenceTimeoutMs + 1000) break
+        if (budget.remaining() < aiTimeout(env) + 3000) break
         const token = crypto.randomUUID()
         const row = await claim(db, entry.group_id, token, now)
-        if (!row) break
+        if (!row || budget.remaining() <= 1000) break
         const event: InboxEvent = { groupId: row.group_id, userId: row.user_id, eventId: row.event_id,
-          eventTime: row.event_time, now, inbox: { receiptId: row.receipt_id, leaseToken: token } }
-        const reply = await processEvent(env, row, event, clock)
-        const timeLeft = deadline - clock()
-        if (reply && timeLeft > 0 && clock() - row.received_at < 50_000 && clock() - row.event_time < 20 * 60_000) {
-          replies.push(deliverReply(env.LINE_CHANNEL_ACCESS_TOKEN, row, reply, Math.min(timeLeft, 10_000)))
-        }
+          eventTime: row.event_time, now, inbox: { receiptId: row.receipt_id, leaseToken: token, canCommit: () => budget.remaining() > 1000 } }
+        await processEvent(env, row, event, budget)
+        if (budget.remaining() > 1000) deliveries.push(drainResults(env, budget, event.eventId)
+          .catch(() => console.error('LINE operation result scan failed', { eventId: event.eventId })))
       }
     } catch {
       console.error('LINE inbox group could not advance', { receiptId: entry.receipt_id })
     }
   }))
-  await Promise.all(replies)
+  await Promise.all(deliveries)
 }
 
 function claim(db: D1Database, groupId: string, token: string, now: number) {
   return db.prepare(`UPDATE webhook_inbox SET status = 'running', attempts = attempts + 1, lease_token = ?, lease_until = ?
     WHERE receipt_id = (SELECT q.receipt_id FROM webhook_inbox q WHERE q.group_id = ?
       AND ${ready} AND ${head} AND ${unlocked} LIMIT 1)
-    RETURNING receipt_id, event_id, group_id, user_id, event_time, received_at, reply_token, input_json, action_json, attempts`)
+    RETURNING receipt_id, event_id, group_id, user_id, event_time, received_at, input_json, action_json, attempts`)
     .bind(token, now + leaseMs, groupId, now, now, maxAttempts, now - retention, now).first<Claimed>()
 }
 
-async function processEvent(env: Env, row: Claimed, event: InboxEvent, clock: () => number) {
+async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: RuntimeBudget) {
   const db = env.DB
+  const { clock } = budget
+  const input: Input = JSON.parse(row.input_json)
   try {
-    const input: Input = JSON.parse(row.input_json)
     const stale = await db.prepare(`SELECT 1 AS stale FROM webhook_group_progress WHERE group_id = ?
       AND (event_time, receipt_id) > (?, ?)`).bind(event.groupId, event.eventTime, row.receipt_id).first()
+    if (!event.inbox.canCommit()) return
     if (stale) {
-      if (await finishInboxEvent(db, event, false, 'out_of_order') && input.type === 'intent' && input.text) {
-        return '先に新しい操作が反映されたため、古い操作は反映されませんでした。必要ならもう一度送ってください。'
-      }
+      const reply = input.type === 'intent' && input.text ? '先に新しい操作が反映されたため、古い操作は反映されませんでした。必要ならもう一度送ってください。' : undefined
+      await finishInboxEvent(db, { ...event, now: clock() }, false, reply, 'out_of_order')
       return
     }
 
@@ -113,10 +114,13 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, clock: ()
     } else {
       if (row.action_json) action = intentSchema.parse(JSON.parse(row.action_json))
       else {
-        const parsed = await parseIntent(env.AI, env.AI_MODEL, input.text, event.eventTime)
+        const timeout = Math.min(aiTimeout(env), budget.remaining() - 3000)
+        if (timeout <= 0) return
+        const parsed = await parseIntent(env.AI, env.AI_MODEL, input.text, event.eventTime, timeout)
+        if (!event.inbox.canCommit()) return
         if (parsed.kind === 'timeout' || parsed.kind === 'unavailable') {
-          const stopped = await retryEvent(db, row, event, clock(), 'ai_' + parsed.kind)
-          return stopped ? 'AI の処理を完了できませんでした。タスクの状態を確認し、必要ならもう一度送ってください。' : undefined
+          await retryEvent(db, row, event, clock(), 'ai_' + parsed.kind, failedInference)
+          return
         }
         if (parsed.kind === 'parsed') {
           action = authorizeIntent(parsed.action, input.text)
@@ -135,15 +139,15 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, clock: ()
       }
     }
 
+    if (!event.inbox.canCommit()) return
     event.now = clock()
     if (action) reply = await dispatchAction(db, event, action)
     // Mutating actions already commit the Inbox result with their D1 batch.
-    if (await wasProcessed(db, event.eventId)) return reply
-    if (await finishInboxEvent(db, event, !!action && action.type !== 'help', failure)) return reply
-  } catch {
-    if (await retryEvent(db, row, event, clock(), 'd1_error')) {
-      return '処理結果を確認できませんでした。もう一度送る前にタスク一覧を確認してください。'
+    if (event.inbox.canCommit() && !await wasProcessed(db, event.eventId)) {
+      await finishInboxEvent(db, { ...event, now: clock() }, !!action && action.type !== 'help', reply, failure)
     }
+  } catch {
+    await retryEvent(db, row, event, clock(), 'd1_error', input.type === 'intent' ? unknownOperation : undefined)
   }
 }
 
@@ -156,22 +160,15 @@ function authorizeIntent(action: TaskAction, text: string) {
   return action
 }
 
-async function retryEvent(db: D1Database, row: Claimed, event: InboxEvent, now: number, reason: string) {
+async function retryEvent(db: D1Database, row: Claimed, event: InboxEvent, now: number, reason: string, reply?: string) {
+  if (!event.inbox.canCommit()) return
   const terminal = row.attempts >= maxAttempts || now - row.received_at >= retention
   console.error('LINE inbox attempt failed', { eventId: row.event_id, attempt: row.attempts, reason })
-  if (terminal) return !!await finishInboxEvent(db, { ...event, now }, false, reason)
+  if (terminal) {
+    await finishInboxEvent(db, { ...event, now }, false, reply, reason)
+    return
+  }
   await db.prepare(`UPDATE webhook_inbox SET status = 'queued', available_at = ?, last_error = ?, lease_token = NULL, lease_until = NULL
     WHERE receipt_id = ? AND status = 'running' AND lease_token = ? AND lease_until > ?`)
     .bind(now + (row.attempts === 1 ? 15_000 : 60_000), reason, row.receipt_id, event.inbox.leaseToken, now).run()
-  return false
-}
-
-async function deliverReply(accessToken: string, row: Claimed, reply: string, timeoutMs: number) {
-  try {
-    const result = await sendReply(accessToken, row.reply_token, reply, timeoutMs)
-    if (!result.ok) console.error('LINE inbox reply failed', { eventId: row.event_id, kind: result.kind,
-      status: result.kind === 'http' ? result.status : undefined })
-  } catch {
-    console.error('LINE inbox reply failed', { eventId: row.event_id, kind: 'unexpected' })
-  }
 }

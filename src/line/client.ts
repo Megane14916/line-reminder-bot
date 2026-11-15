@@ -1,22 +1,24 @@
 import { isLosslessNumber, parse } from 'lossless-json'
+import { defaultLineTimeout } from '../runtime-budget'
 
-type SendResult =
+export type SendResult =
   | { ok: true; messageId?: string }
   | { ok: false; kind: 'http'; status: number; retryAfter?: string }
   | { ok: false; kind: 'network' | 'timeout' }
 
-export const pushTimeoutMs = 10_000
+export const pushTimeoutMs = defaultLineTimeout
 
 export function sendReply(accessToken: string, replyToken: string, text: string, timeoutMs = pushTimeoutMs) {
   return postMessage('reply', accessToken, JSON.stringify({ replyToken, messages: [{ type: 'text', text }] }), undefined, timeoutMs)
 }
 
-export function sendPush(accessToken: string, groupId: string, text: string, retryKey: string) {
+export function sendPush(accessToken: string, groupId: string, text: string, retryKey: string, timeoutMs = pushTimeoutMs, readId = true) {
   const body = JSON.stringify({ to: groupId, messages: [{ type: 'text', text }] })
-  return postMessage('push', accessToken, body, retryKey)
+  return postMessage('push', accessToken, body, retryKey, timeoutMs, readId)
 }
 
-async function postMessage(endpoint: 'reply' | 'push', accessToken: string, body: string, retryKey?: string, timeoutMs = pushTimeoutMs): Promise<SendResult> {
+async function postMessage(endpoint: 'reply' | 'push', accessToken: string, body: string, retryKey?: string,
+  timeoutMs = pushTimeoutMs, readId = true): Promise<SendResult> {
   const headers = new Headers({
     Authorization: `Bearer ${accessToken}`,
     'Content-Type': 'application/json',
@@ -34,11 +36,19 @@ async function postMessage(endpoint: 'reply' | 'push', accessToken: string, body
     return { ok: false, kind: signal?.aborted ? 'timeout' : 'network' }
   }
   if (response.ok || (retryKey && response.status === 409 && response.headers.has('X-Line-Accepted-Request-Id'))) {
-    const messageId = endpoint === 'push' ? await readMessageId(response) : undefined
+    const messageId = endpoint === 'push' && readId ? await readMessageId(response) : undefined
     return messageId ? { ok: true, messageId } : { ok: true }
   }
-  const retryAfter = endpoint === 'push' && response.status === 429 ? response.headers.get('Retry-After') : null
+  const retryAfter = response.status === 429 ? response.headers.get('Retry-After') : null
   return { ok: false, kind: 'http', status: response.status, ...(retryAfter ? { retryAfter } : {}) }
+}
+
+export function retryDelay(result: Extract<SendResult, { ok: false }>, now: number, delay: number) {
+  if (result.kind !== 'http' || (result.status >= 500 && result.status < 600)) return delay
+  if (result.status !== 429) return null
+  const after = result.retryAfter?.trim() ?? ''
+  const requested = /^\d+$/.test(after) ? Number(after) * 1000 : Date.parse(after) - now
+  return Math.max(delay, 15 * 60_000, Number.isNaN(requested) ? 0 : requested)
 }
 
 async function readMessageId(response: Response) {

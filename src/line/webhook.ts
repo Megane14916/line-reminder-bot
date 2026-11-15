@@ -1,9 +1,11 @@
 import { Hono } from 'hono'
 import { acceptEvents, drainInbox, type Operation } from './inbox'
+import { runtimeBudget, withinBudget } from '../runtime-budget'
 
 export const lineWebhook = new Hono<{ Bindings: Env }>()
 
 lineWebhook.post('/', async (c) => {
+  const receivedAt = Date.now()
   const signature = c.req.header('x-line-signature')
   if (!signature) return c.text('Unauthorized', 401)
   const env = c.env
@@ -24,12 +26,13 @@ lineWebhook.post('/', async (c) => {
   if (!env.LINE_CHANNEL_ACCESS_TOKEN) return c.text('Service Unavailable', 503)
 
   try {
-    await acceptEvents(env.DB, operations, Date.now())
+    await acceptEvents(env.DB, operations, receivedAt)
   } catch {
     console.error('LINE inbox intake failed', { events: operations.length })
     return c.text('Service Unavailable', 503)
   }
-  c.executionCtx.waitUntil(drainInbox(env).catch(() => console.error('LINE inbox drain failed')))
+  const budget = runtimeBudget()
+  c.executionCtx.waitUntil(withinBudget(budget, () => drainInbox(env, budget)).catch(() => console.error('LINE inbox drain failed')))
   return c.body(null, 200)
 })
 

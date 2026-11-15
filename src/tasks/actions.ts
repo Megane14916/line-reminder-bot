@@ -18,7 +18,8 @@ export async function dispatchAction(db: D1Database, event: TaskEvent, action: T
     case 'set_group_default': {
       const update = db.prepare(`INSERT INTO group_reminder_defaults (group_id, rule_json) VALUES (?, ?)
         ON CONFLICT(group_id) DO UPDATE SET rule_json = excluded.rule_json`).bind(event.groupId, JSON.stringify(action.rule))
-      if (await applyEvent(db, event, update)) return '今後登録するタスクの通知設定を変更しました。'
+      const reply = '今後登録するタスクの通知設定を変更しました。'
+      if (await applyEvent(db, event, reply, update)) return reply
       return
     }
     case 'create_task': return createTask(db, event, action)
@@ -35,9 +36,8 @@ async function createTask(db: D1Database, event: TaskEvent, action: Extract<Task
   const insert = db.prepare(`INSERT INTO tasks (group_id, category, title, due_date, created_by, created_at,
     reminder_rule, reminder_anchor, next_reminder_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .bind(event.groupId, action.category, action.title, action.dueDate, event.userId, event.now, JSON.stringify(rule), event.now, next)
-  if (await applyEvent(db, event, insert, saveContext(db, event, action.type, 'new', null, true))) {
-    return `「${action.title}」を登録しました。期限 ${action.dueDate}\n通知 ${describeSchedule(rule, action.dueDate, event.now, event.now)}`
-  }
+  const reply = `「${action.title}」を登録しました。期限 ${action.dueDate}\n通知 ${describeSchedule(rule, action.dueDate, event.now, event.now)}`
+  if (await applyEvent(db, event, reply, insert, saveContext(db, event, action.type, 'new', null, true))) return reply
 }
 
 export async function answerSelection(db: D1Database, event: TaskEvent, id: number) {
@@ -62,8 +62,9 @@ async function targetOperation(db: D1Database, event: TaskEvent, action: TargetA
       const options = candidates.slice(0, 5)
       const { target: _target, ...operation } = action
       const pending = JSON.stringify({ action: operation, ids: options.map(({ id }) => id) })
-      if (!await applyEvent(db, event, saveContext(db, event, action.type, null, pending))) return
-      return `どのタスクですか？ #番号 を送ってください。\n${options.map(taskLine).join('\n')}${candidates.length > 5 ? '\nほかにも候補があります。日付を添えると絞り込めます。' : ''}`
+      const reply = `どのタスクですか？ #番号 を送ってください。\n${options.map(taskLine).join('\n')}${candidates.length > 5 ? '\nほかにも候補があります。日付を添えると絞り込めます。' : ''}`
+      if (await applyEvent(db, event, reply, saveContext(db, event, action.type, null, pending))) return reply
+      return
     }
     task = candidates[0] ?? null
   } else {
@@ -81,9 +82,11 @@ async function changeTask(db: D1Database, event: TaskEvent, action: TargetAction
   let { title, category, due_date: dueDate, status, deleted_at: deletedAt, reminder_enabled: enabled } = task
   let reply: string
   switch (action.type) {
-    case 'get_reminder':
-      if (!await applyEvent(db, event, saveContext(db, event, action.type, task.id))) return
-      return `「${title}」の通知 ${enabled && status === 'open' ? describeSchedule(rule, dueDate, anchor, event.now) : '停止中です。'}`
+    case 'get_reminder': {
+      const reply = `「${title}」の通知 ${enabled && status === 'open' ? describeSchedule(rule, dueDate, anchor, event.now) : '停止中です。'}`
+      if (await applyEvent(db, event, reply, saveContext(db, event, action.type, task.id))) return reply
+      return
+    }
     case 'update_task':
       if (action.dueDate && action.dueDate < todayInJapan(event.now)) return '過去の日付は締切に指定できません。'
       if (action.dueDate && action.dueDate !== dueDate) anchor = event.now
@@ -137,8 +140,9 @@ async function changeTask(db: D1Database, event: TaskEvent, action: TargetAction
     .bind(title, category, dueDate, status, deletedAt, status === 'done' ? task.status === 'done' ? task.completed_at : event.now : null,
       JSON.stringify(rule), enabled, anchor, next, event.groupId, task.id, task.reminder_version,
       ...(context ? [event.groupId, event.userId, 'pending' in context ? context.pending : context.recent, event.now, event.eventTime] : []))
-  const results = await applyEvent(db, event, update, saveContext(db, event, action.type, task.id, null, true))
-  if (results) return results[0].meta.changes ? reply : '別の操作が先に反映されました。現在の状態を一覧で確認してください。'
+  const unchanged = '操作結果を確認できませんでした。現在の状態を一覧で確認してください。'
+  const results = await applyEvent(db, event, { changed: reply, unchanged }, update, saveContext(db, event, action.type, task.id, null, true))
+  if (results) return results[0].meta.changes && results[1].meta.changes ? reply : unchanged
 }
 
 function taskLine(task: Task) {

@@ -1,4 +1,5 @@
 import type { TaskAction } from './intent'
+import { saveOperationResult, type OperationResult } from '../line/outbox'
 
 export type TaskCategory = 'deadline' | 'belonging'
 export type Task = {
@@ -7,7 +8,7 @@ export type Task = {
 }
 export type TaskEvent = {
   groupId: string; userId: string; eventId: string; eventTime: number; now: number
-  inbox?: { receiptId: number; leaseToken: string }
+  inbox?: { receiptId: number; leaseToken: string; canCommit: () => boolean }
 }
 export type TaskContext = { task_id: number | null; pending_json: string | null }
 const taskListLimit = 20
@@ -58,16 +59,18 @@ export function saveContext(db: D1Database, event: TaskEvent, operation: string,
       event.now + 10 * 60_000, event.eventTime)
 }
 
-export async function applyEvent(db: D1Database, event: TaskEvent, ...changes: D1PreparedStatement[]) {
-  return commitEvent(db, event, changes, true)
+export async function applyEvent(db: D1Database, event: TaskEvent, result: OperationResult, ...changes: D1PreparedStatement[]) {
+  return commitEvent(db, event, changes, true, result)
 }
 
-export function finishInboxEvent(db: D1Database, event: TaskEvent, advance: boolean, failure?: string) {
-  return commitEvent(db, event, [], advance, failure)
+export function finishInboxEvent(db: D1Database, event: TaskEvent, advance: boolean, result?: string, failure?: string) {
+  return commitEvent(db, event, [], advance, result, failure)
 }
 
-async function commitEvent(db: D1Database, event: TaskEvent, changes: D1PreparedStatement[], advance: boolean, failure?: string) {
+async function commitEvent(db: D1Database, event: TaskEvent, changes: D1PreparedStatement[], advance: boolean,
+  result?: OperationResult, failure?: string) {
   const inbox = event.inbox
+  if (inbox && !inbox.canCommit()) return
   const now = event.now
   // The NOT NULL constraint rolls back the batch if this invocation lost its lease.
   const record = inbox ? db.prepare(`INSERT INTO processed_events (event_id, processed_at) VALUES ((
@@ -82,6 +85,7 @@ async function commitEvent(db: D1Database, event: TaskEvent, changes: D1Prepared
     : db.prepare('INSERT INTO processed_events (event_id, processed_at) VALUES (?, ?)').bind(event.eventId, now)
   const completion: D1PreparedStatement[] = []
   if (inbox) {
+    if (result) completion.push(saveOperationResult(db, inbox.receiptId, result, now, failure?.startsWith('ai_') ?? false))
     completion.push(db.prepare(`UPDATE webhook_inbox SET status = ?, finished_at = ?, last_error = ?, input_json = NULL,
       action_json = NULL, reply_token = NULL, lease_token = NULL, lease_until = NULL WHERE receipt_id = ?`)
       .bind(failure ? 'failed' : 'succeeded', now, failure ?? null, inbox.receiptId))
@@ -94,6 +98,7 @@ async function commitEvent(db: D1Database, event: TaskEvent, changes: D1Prepared
     const results = await db.batch([record, ...changes, ...completion])
     return results.slice(1, changes.length + 1)
   } catch (error) {
+    if (inbox && !inbox.canCommit()) return
     if (!await wasProcessed(db, event.eventId)) throw error
   }
 }
