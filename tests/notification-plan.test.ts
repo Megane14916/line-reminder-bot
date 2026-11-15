@@ -106,6 +106,10 @@ test('grounding rejects dropped dates, swapped edits, wrong clocks and non-expli
   expect(validateNotificationIntent(make([{ op: 'add', when: relative(5, '09:00') },
     { op: 'add', when: relative(3, '10:00') }]), '5日前の10時と3日前の9時にも通知して', now))
     .toEqual({ type: 'clarify', question: 'time' })
+  expect(validateNotificationIntent(make([{ op: 'move', selector: relative(7, '11:00'), to: { kind: 'time', time: '08:00' } },
+    { op: 'add', when: relative(3, '09:00') }]), '7日前だけを8時にして、3日前の9時も追加して', now))
+    .toEqual(make([{ op: 'move', selector: { kind: 'relative', daysBefore: 7 }, to: { kind: 'time', time: '08:00' } },
+      { op: 'add', when: relative(3, '09:00') }]))
 })
 
 test('recognizes complete literal corrections without guessing a time or a task', () => {

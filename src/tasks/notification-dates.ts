@@ -35,6 +35,15 @@ function relativeDays(text: string) {
   })
 }
 
+function relativeClockEvidence(text: string) {
+  const available = clocks(text)
+  return [...text.matchAll(relativeDate)].flatMap((part) => {
+    const end = part.index + part[0].length
+    const clock = available.find((entry) => entry.index >= end && /^[\sの]*$/.test(text.slice(end, entry.index)))
+    return clock?.time ? [{ daysBefore: relativeDays(part[0])[0], time: clock.time }] : []
+  })
+}
+
 export function explicitNotificationDates(text: string, now: number) {
   const normalized = text.normalize('NFKC')
   const today = todayInJapan(now)
@@ -170,6 +179,10 @@ export function validateNotificationIntent(action: TaskAction, text: string, now
   const keepAbsolute = explicitNotificationDates(unchangedClauses, now)
   const keepRelative = relativeDays(unchangedClauses)
   const changedRelative = relativeDays(changedClauses)
+  const statedRelativeTimes = relativeClockEvidence(changedClauses)
+  const noStatedClock = (source: NotificationDate) => source.kind === 'relative'
+    ? !statedRelativeTimes.some((clock) => clock.daysBefore === source.daysBefore)
+    : !dates.some((date) => date.date === source.date && date.time)
   const edits = action.edits.filter((edit) => {
     if (edit.op !== 'add') return true
     const when = edit.when
@@ -179,14 +192,12 @@ export function validateNotificationIntent(action: TaskAction, text: string, now
   }).map((edit): NotificationEdit => {
     if (!times.length && edit.op === 'add') return { ...edit, when: { ...edit.when, time: undefined } }
     if (!times.length && edit.op === 'repeat') return { ...edit, recurrence: { ...edit.recurrence, time: undefined } }
-    if (edit.op === 'remove' && (edit.selector.kind === 'relative' || edit.selector.kind === 'absolute') && !times.length) {
+    if (edit.op === 'remove' && (edit.selector.kind === 'relative' || edit.selector.kind === 'absolute') && noStatedClock(edit.selector)) {
       return { ...edit, selector: { ...edit.selector, time: undefined } }
     }
     if (edit.op === 'move') {
       const source = edit.selector
-      const oldTimeOmitted = !times.length || (times.length === 1 && times[0].time === edit.to.time &&
-        !/じゃなく|ではなく/.test(normalized))
-      return { ...edit, selector: oldTimeOmitted && (source.kind === 'relative' || source.kind === 'absolute')
+      return { ...edit, selector: (source.kind === 'relative' || source.kind === 'absolute') && noStatedClock(source)
         ? { ...source, time: undefined } : source,
         to: !times.length && edit.to.kind !== 'time' ? { ...edit.to, time: undefined } : edit.to }
     }
@@ -229,13 +240,8 @@ export function validateNotificationIntent(action: TaskAction, text: string, now
     return { type: 'clarify', question: 'day' }
   }
   if (!edits.some((edit) => edit.op === 'repeat')) {
-    const relevantClocks = clocks(relevant)
-    for (const part of relevant.matchAll(relativeDate)) {
-      const end = part.index + part[0].length
-      const clock = relevantClocks.find((entry) => entry.index >= end && /^[\sの]*$/.test(relevant.slice(end, entry.index)))
-      if (clock?.time && !operands.some((when) => when.kind === 'relative' &&
-        when.daysBefore === relativeDays(part[0])[0] && when.time === clock.time)) return { type: 'clarify', question: 'time' }
-    }
+    if (relativeClockEvidence(relevant).some((clock) => !operands.some((when) => when.kind === 'relative' &&
+      when.daysBefore === clock.daysBefore && when.time === clock.time))) return { type: 'clarify', question: 'time' }
   }
   if (edits.some((edit) => edit.op === 'add' && edit.when.time && !times.some((clock) => edit.when.time === clock.time))) {
     return { type: 'clarify', question: 'time' }
