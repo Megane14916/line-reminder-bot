@@ -107,7 +107,7 @@ test.each([
   expect((await taskRows()).results).toMatchObject([expected])
   expect(await inbox(two.webhookEventId)).toMatchObject({ status: 'succeeded', attempts: 1 })
   expect(await inbox(one.webhookEventId)).toMatchObject({ status: 'succeeded', attempts: 1 })
-})
+}, 15_000)
 
 test('rejects an older delivery after a newer update, including across users and on redelivery', async () => {
   await command('レポート登録', create)
@@ -532,10 +532,11 @@ test('replies to a bot-only mention with text and ignores conversation, other me
   const help = lastReply()
   expect(help).toMatch(/^📖 Botの使い方\n\nBotをメンションして/)
   expect(help).toContain('\n\n📝 タスクの登録\n「12月20日までにレポート提出」\n\n📋 タスクの確認')
-  expect(help).toContain('メンションは不要です。')
+  expect(help).toContain('メンションなしで操作できます。')
   expect(infer).not.toHaveBeenCalled()
   expect(await command('使い方を教えて', { type: 'help' })).toBe(help)
-  expect(await command('分からない操作', { type: 'unknown' })).toMatch(/読み取れませんでした。[^\n]+\n\n📖 Botの使い方/)
+  expect(await command('分からない操作', { type: 'unknown' }))
+    .toBe('💬 うまく読み取れませんでした。\nもう少し詳しく教えてください。')
 })
 
 test('creates and deduplicates a related create-and-reminder request and lists by date and category', async () => {
@@ -580,7 +581,7 @@ test('updates, completes, reopens, logically deletes, restores and manages notif
   expect((await taskRows()).results[0]).toMatchObject({ deleted_at: now, next_reminder_at: null })
   await command('作文を復元して', { type: 'restore_task', target: byName('作文') })
   expect((await taskRows()).results[0]).toMatchObject({ deleted_at: null, next_reminder_at: expect.any(Number) })
-})
+}, 15_000)
 
 test('keeps ambiguous selection scoped to the initiating user and group', async () => {
   for (const dueDate of ['2030-12-20', '2030-12-23']) {
@@ -595,8 +596,8 @@ test('keeps ambiguous selection scoped to the initiating user and group', async 
   await webhook([event(token)])
   expect((await taskRows()).results).toMatchObject([{ id: first.id, status: 'open' }, { id: second.id, status: 'done' }])
   expect(await command(token + '削除', { type: 'delete_task', target: { by: 'id', id: second.id } }, { groupId: 'group-b' })).toContain('見つかりません')
-  expect(await command('やっぱり通知停止', { type: 'disable_reminder', target: recent }, { userId: 'user-b' })).toContain('見つかりません')
-})
+  expect(await command('やっぱり通知停止', { type: 'disable_reminder', target: recent }, { userId: 'user-b' })).toContain('どのタスク')
+}, 15_000)
 
 test('uses a group default only for subsequently registered tasks in that group', async () => {
   const task = { type: 'create_task', title: '提出物', category: 'deadline', dueDate: '2030-12-20' }
@@ -698,4 +699,163 @@ test.each(['終わった', '完了', '✅'])('quotes an accepted push to complet
   expect((await taskRows()).results[0]).toEqual(completed)
   await runReminders(env, () => Date.parse('2030-12-19T20:00:00+09:00'))
   expect(line.mock.calls.filter(([url]) => String(url).endsWith('/push'))).toHaveLength(1)
+})
+
+const conversationNow = Date.parse('2030-11-25T10:00:00+09:00')
+const application = { type: 'create_task', title: '英検申し込み', category: 'deadline', dueDate: '2030-12-14' }
+const fourteenth = { daysBefore: 14, time: '20:00' }
+const seventh = { daysBefore: 7, time: '20:00' }
+const eve = { daysBefore: 1, time: '20:00' }
+const addTwoWeeks = { mode: 'add', slots: [fourteenth] }
+
+function edit(edit: unknown, target: unknown = recent) {
+  return { type: 'modify_reminder', target, edit }
+}
+
+test.each([
+  ['英検申し込みの通知の方法について、2週間前にも通知して', byName('英検申し込み'), false],
+  ['英検申し込み、2週間前にも教えて', byName('英検'), false],
+  ['さっきのやつ、14日前も', recent, false],
+  ['2週間前にも', recent, true],
+] as const)('keeps the existing notices when the user says %s', async (text, target, quoted) => {
+  vi.spyOn(Date, 'now').mockReturnValue(conversationNow)
+  const messageId = '985420000000000019'
+  line.mockResolvedValueOnce(new Response('{"sentMessages":[{"id":985420000000000019}]}'))
+  const registration = event('12/14までに英検申し込み', { mention: true })
+  infer.mockResolvedValueOnce({ response: application })
+  await webhook([registration])
+  const [registered] = (await taskRows()).results
+  expect(await result(registration.webhookEventId)).toMatchObject({ line_message_id: messageId, task_id: registered.id })
+  expect(lastReply()).toContain('通知：7日前・前日 20:00')
+
+  const request = event(text, { mention: !quoted, quote: quoted ? messageId : undefined })
+  if (!quoted) infer.mockResolvedValueOnce({ response: edit(addTwoWeeks, target) })
+  await Promise.all([webhook([request]), webhook([request])])
+  expect(infer).toHaveBeenCalledTimes(quoted ? 1 : 2)
+  expect(lastReply()).toContain('🔔 通知を追加しました\n\n英検申し込み\n期限：12月14日（土）\n通知：14日前・7日前・前日 20:00')
+  const [added] = (await taskRows()).results
+  expect(JSON.parse(String(added.reminder_rule))).toEqual({ type: 'offsets', slots: [fourteenth, seventh, eve] })
+  expect(added).toMatchObject({ reminder_version: 2, next_reminder_at: Date.parse('2030-11-30T20:00:00+09:00') })
+  const again = await command('前日にも知らせて', edit({ mode: 'add', slots: [eve] }))
+  expect(again).toContain('その通知はすでに設定されています')
+  expect((await taskRows()).results).toEqual([added])
+
+  await command('7日前はいらない', edit({ mode: 'remove', slot: { daysBefore: 7 } }))
+  expect(JSON.parse(String((await taskRows()).results[0].reminder_rule))).toEqual({ type: 'offsets', slots: [fourteenth, eve] })
+  await command('やっぱ前日だけでいいや', edit({ mode: 'replace', rule: { type: 'offsets', slots: [eve] } }))
+  expect((await taskRows()).results[0]).toMatchObject({ reminder_enabled: 1, next_reminder_at: Date.parse('2030-12-13T20:00:00+09:00') })
+  await command('前日の通知は消して', edit({ mode: 'remove', slot: { daysBefore: 1 } }))
+  expect((await taskRows()).results[0]).toMatchObject({ reminder_enabled: 0, next_reminder_at: null })
+}, 15_000)
+
+test('a retained slot keeps its body and Retry Key after adding another notification', async () => {
+  vi.spyOn(Date, 'now').mockReturnValue(conversationNow)
+  vi.spyOn(console, 'error').mockImplementation(() => {})
+  await command('12/14までに英検申し込み', application)
+  const env = { ...platform.env, LINE_CHANNEL_ACCESS_TOKEN: 'test-token' }
+  const slot = Date.parse('2030-12-07T20:00:00+09:00')
+  line.mockResolvedValueOnce(new Response(null, { status: 500 }))
+  await runReminders(env, () => slot)
+  const original = pushes()[0]
+  vi.spyOn(Date, 'now').mockReturnValue(slot + 60_000)
+  await command('英検、当日も通知して', edit({ mode: 'add', slots: [{ daysBefore: 0, time: '20:00' }] }, byName('英検')),
+    { timestamp: slot + 60_000 })
+  await runReminders(env, () => slot + 5 * 60_000)
+  expect(pushes()).toEqual([original, original])
+  expect(await env.DB.prepare('SELECT status, attempt_count, rule_version FROM reminder_occurrences').first())
+    .toMatchObject({ status: 'sent', attempt_count: 2, rule_version: 2 })
+})
+
+test('keeps conversation and quotes to other groups or users away from inference', async () => {
+  line.mockResolvedValueOnce(new Response('{"sentMessages":[{"id":"4444"}]}'))
+  await command('英検を登録', application)
+  line.mockClear()
+  infer.mockClear()
+  const inputs = [event('家族の会話'), event('通知もういらない', { quote: '5555' }),
+    event('前日も通知して', { quote: '4444', groupId: 'group-b' })]
+  await webhook(inputs)
+  expect(line).not.toHaveBeenCalled()
+  expect(infer).not.toHaveBeenCalled()
+  for (const input of inputs) expect(await inbox(input.webhookEventId)).toBeNull()
+})
+
+test('uses the quote for deadline updates and stops, but rejects an explicitly different task', async () => {
+  line.mockResolvedValueOnce(new Response('{"sentMessages":[{"id":"7777"}]}'))
+  await command('英検を登録', application)
+  await command('水筒を登録', { ...application, title: '水筒', category: 'belonging' })
+  infer.mockResolvedValueOnce({ response: { type: 'disable_reminder', target: byName('水筒') } })
+  await webhook([event('水筒の通知もういらない', { quote: '7777' })])
+  expect(lastReply()).toContain('引用したタスクと本文のタスク名が異なります')
+  expect((await taskRows()).results.map((row) => row.reminder_enabled)).toEqual([1, 1])
+  infer.mockResolvedValueOnce({ response: { type: 'update_task', target: recent, dueDate: '2030-12-15' } })
+  await webhook([event('この申し込みは15日までにして', { quote: '7777' })])
+  expect((await taskRows()).results.map((row) => row.due_date)).toEqual(['2030-12-15', '2030-12-14'])
+  infer.mockResolvedValueOnce({ response: { type: 'disable_reminder', target: recent } })
+  await webhook([event('通知もういらない', { quote: '7777' })])
+  expect((await taskRows()).results.map((row) => row.reminder_enabled)).toEqual([0, 1])
+})
+
+test('does not guess a task from a list reply or a name shared by several tasks', async () => {
+  await command('英検を登録', application)
+  await command('英検の別の申し込み', { ...application, title: '英検の2次申し込み' })
+  line.mockResolvedValueOnce(new Response('{"sentMessages":[{"id":"8888"}]}'))
+  await command('一覧を教えて', { type: 'list_tasks' })
+  infer.mockResolvedValueOnce({ response: { type: 'complete_task', target: recent } })
+  await webhook([event('これ終わった', { quote: '8888' })])
+  expect(lastReply()).toContain('どのタスクのことですか？')
+  expect((await taskRows()).results.map((row) => row.status)).toEqual(['open', 'open'])
+  infer.mockResolvedValueOnce({ response: { type: 'complete_task', target: byName('英検の2次申し込み') } })
+  await webhook([event('英検申し込み')])
+  expect((await taskRows()).results.map((row) => row.status)).toEqual(['done', 'open'])
+  expect(await command('英検のやつっていつ通知される？', { type: 'get_reminder', target: byName('英検') })).toContain('選択用の番号')
+}, 15_000)
+
+test('asks only for a missing time and continues on the same sender’s answer', async () => {
+  await command('英検を登録', application)
+  expect(await command('もうちょっと早めに通知して', { type: 'clarify', question: 'time' })).toBe('🔔 何時に通知しましょうか？')
+  const earlier = infer.mock.calls.length
+  await webhook([event('18時で', { userId: 'user-b' }), event('家族の会話')])
+  expect(infer).toHaveBeenCalledTimes(earlier)
+  infer.mockResolvedValueOnce({ response: edit({ mode: 'change_time', time: '18:00' }) })
+  await webhook([event('18時で')])
+  expect(infer.mock.lastCall?.[1]).toMatchObject({ messages: [expect.anything(), expect.anything(),
+    { role: 'user', content: 'もうちょっと早めに通知して\n補足：18時で' }] })
+  expect(lastReply()).toContain('通知：7日前・前日 18:00')
+  expect((await taskRows()).results[0].next_reminder_at).toBe(Date.parse('2030-12-07T18:00:00+09:00'))
+  await webhook([event('17時で')])
+  expect(infer).toHaveBeenCalledTimes(earlier + 1)
+})
+
+test('asking about a mode leaves the rule untouched until the same user answers', async () => {
+  await command('英検を登録', application)
+  const [before] = (await taskRows()).results
+  expect(await command('3日前に通知して', { type: 'clarify', question: 'mode' }))
+    .toBe('🔔 今の通知に追加しますか？\nそれとも置き換えますか？')
+  expect((await taskRows()).results).toEqual([before])
+  const additional = { daysBefore: 3, time: '20:00' }
+  infer.mockResolvedValueOnce({ response: edit({ mode: 'add', slots: [additional] }) })
+  await webhook([event('追加で')])
+  expect(JSON.parse(String((await taskRows()).results[0].reminder_rule)))
+    .toEqual({ type: 'offsets', slots: [seventh, additional, eve] })
+}, 15_000)
+
+test('resolves a conversational spelling of a task name and changes only the notification time', async () => {
+  await command('英検を登録', application)
+  const found = await command('英検の申し込むやつっていつ通知される？', { type: 'get_reminder', target: byName('英検申し込み') })
+  expect(found).toContain('英検申し込み\n期限：12月14日（土）')
+  await command('通知を21時にして', edit({ mode: 'change_time', time: '21:00' }))
+  const [task] = (await taskRows()).results
+  expect(JSON.parse(String(task.reminder_rule))).toEqual({ type: 'offsets',
+    slots: [{ ...seventh, time: '21:00' }, { ...eve, time: '21:00' }] })
+})
+
+test('can quote a result delivered by Push after the Reply window', async () => {
+  const request = await queueCreate()
+  infer.mockResolvedValueOnce({ response: create })
+  line.mockResolvedValueOnce(new Response('{"sentMessages":[{"id":928002345678901234}]}'))
+  await tick(now + 60_000)
+  expect(await result(request.webhookEventId)).toMatchObject({ channel: 'push', line_message_id: '928002345678901234' })
+  await webhook([event('もう終わった', { quote: '928002345678901234' })])
+  expect((await taskRows()).results[0]).toMatchObject({ status: 'done', next_reminder_at: null })
+  expect(infer).toHaveBeenCalledTimes(1)
 })

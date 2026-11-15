@@ -23,10 +23,12 @@ lineWebhook.post('/', async (c) => {
   if (!isRecord(payload) || !Array.isArray(payload.events)) return c.text('Bad Request', 400)
   const operations = payload.events.map(getOperation).filter((operation): operation is Operation => !!operation)
   if (!operations.length) return c.body(null, 200)
-  if (!env.LINE_CHANNEL_ACCESS_TOKEN) return c.text('Service Unavailable', 503)
+  const explicit = operations.some(({ input }) => input.type === 'intent' || input.type === 'selection' || input.type === 'quote' && input.mentioned)
+  if (!env.LINE_CHANNEL_ACCESS_TOKEN) return explicit ? c.text('Service Unavailable', 503) : c.body(null, 200)
 
   try {
-    await acceptEvents(env.DB, operations, receivedAt)
+    const accepted = await acceptEvents(env.DB, operations, receivedAt)
+    if (!accepted && !explicit) return c.body(null, 200)
   } catch {
     console.error('LINE inbox intake failed', { events: operations.length })
     return c.text('Service Unavailable', 503)
@@ -57,15 +59,15 @@ function getOperation(event: unknown): Operation | undefined {
   const self = mentionees.filter((entry) => isRecord(entry) && entry.isSelf === true)
   const text = stripMentions(message.text, self)
   if (text === undefined) return
-  if (typeof quotedMessageId === 'string' && /^\d+$/.test(quotedMessageId)
-    && /^(?:終わった|完了(?:した|しました)?|済(?:み)?|できた|✅)[。！!]*$/.test(text)) {
-    return { ...context, input: { type: 'quote', messageId: quotedMessageId } }
-  }
   const selection = /^#([1-9]\d{0,15})$/.exec(text)
   if (selection && Number.isSafeInteger(Number(selection[1]))) {
     return { ...context, input: { type: 'selection', id: Number(selection[1]) } }
   }
+  if (typeof quotedMessageId === 'string' && /^\d+$/.test(quotedMessageId)) {
+    return { ...context, input: { type: 'quote', messageId: quotedMessageId, text: text.slice(0, 2001), mentioned: self.length > 0 } }
+  }
   if (self.length) return { ...context, input: { type: 'intent', text: text.slice(0, 2001) } }
+  if (text && text.length <= 100) return { ...context, input: { type: 'followup', text } }
 }
 
 function stripMentions(text: string, mentions: unknown[]) {

@@ -16,16 +16,18 @@ type Delivery = {
   reply_until: number; expires_at: number; push_attempts: number; status: 'replying' | 'pushing'
 }
 
-export function saveOperationResult(db: D1Database, receiptId: number, message: OperationResult, now: number, forcePush: boolean) {
+export function saveOperationResult(db: D1Database, receiptId: number, message: OperationResult, now: number, forcePush: boolean,
+  linkTask: boolean) {
   const body = typeof message === 'string' ? '?' : 'CASE WHEN changes() = 1 THEN ? ELSE ? END'
   return db.prepare(`INSERT INTO operation_result_outbox
-    (event_id, group_id, text, reply_token, reply_until, retry_key, status, available_at, expires_at)
+    (event_id, group_id, text, reply_token, reply_until, retry_key, status, available_at, expires_at, task_id)
     SELECT event_id, group_id, ${body}, CASE WHEN ? THEN NULL ELSE reply_token END,
       min(received_at + 50000, event_time + 1190000), ?,
-      CASE WHEN ? THEN 'push_pending' ELSE 'reply_pending' END, ?, ?
-    FROM webhook_inbox WHERE receipt_id = ?`)
+      CASE WHEN ? THEN 'push_pending' ELSE 'reply_pending' END, ?, ?,
+      CASE WHEN ? AND changes() = 1 THEN (SELECT task_id FROM task_contexts WHERE group_id = q.group_id AND user_id = q.user_id) END
+    FROM webhook_inbox q WHERE receipt_id = ?`)
     .bind(...(typeof message === 'string' ? [message] : [message.changed, message.unchanged]),
-      Number(forcePush), crypto.randomUUID(), Number(forcePush), now, now + retentionMs, receiptId)
+      Number(forcePush), crypto.randomUUID(), Number(forcePush), now, now + retentionMs, Number(linkTask), receiptId)
 }
 
 // Inbox expiry and its user-facing outcome commit together, even if no worker reaches the last attempt.
@@ -35,7 +37,7 @@ export function expiredOperationResults(db: D1Database, expired: string, now: nu
       0, lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))), 2) ||
       '-8' || substr(lower(hex(randomblob(2))), 2) || '-' || lower(hex(randomblob(6))),
       'push_pending', ?, ?
-    FROM webhook_inbox WHERE receipt_id IN (${expired}) AND json_extract(input_json, '$.type') = 'intent'
+    FROM webhook_inbox WHERE receipt_id IN (${expired}) AND json_extract(input_json, '$.type') IN ('intent', 'quote', 'followup')
     ON CONFLICT(event_id) DO NOTHING`)
     .bind(unknownOperation, now, now + retentionMs, ...bindings)
 }
@@ -102,17 +104,17 @@ async function deliverResult(env: Env, id: string, budget: RuntimeBudget) {
 
   const access = env.LINE_CHANNEL_ACCESS_TOKEN
   if (reply && row.reply_token === null) throw new Error('Reply lease requires a token')
-  const result = row.reply_token === null ? await sendPush(access, row.group_id, row.text, row.retry_key, timeout, false)
+  const result = row.reply_token === null ? await sendPush(access, row.group_id, row.text, row.retry_key, timeout)
     : await sendReply(access, row.reply_token, row.text, timeout)
   if (budget.remaining() <= 0) return
 
   const completedAt = budget.clock()
   const { status, next, error } = deliveryOutcome(row, result, completedAt)
   if (error) console.error('LINE operation result attempt failed', { eventId: id, channel: reply ? 'reply' : 'push', error })
-  await db.prepare(`UPDATE operation_result_outbox SET status = ?, available_at = ?, last_error = ?, finished_at = ?,
+  await db.prepare(`UPDATE operation_result_outbox SET status = ?, available_at = ?, last_error = ?, finished_at = ?, line_message_id = ?,
     reply_token = NULL, text = CASE WHEN ? = 'push_pending' THEN text ELSE NULL END, lease_token = NULL, lease_until = NULL
     WHERE event_id = ? AND lease_token = ?`)
-    .bind(status, next ?? completedAt, error, next === null ? completedAt : null, status, id, token).run()
+    .bind(status, next ?? completedAt, error, next === null ? completedAt : null, result.ok ? result.messageId ?? null : null, status, id, token).run()
 }
 
 function deliveryOutcome(row: Delivery, result: SendResult, now: number) {

@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { ruleSchema, timeSchema } from './schedule'
+import { reminderEditSchema } from './reminder-edits'
 
 const category = z.enum(['deadline', 'belonging'])
 const title = z.string().trim().min(1).max(100).regex(/^[^\u0000\r\n]+$/)
@@ -22,9 +23,13 @@ export const intentSchema = z.discriminatedUnion('type', [
     z.strictObject({ by: z.literal('rule'), rule: ruleSchema }), z.strictObject({ by: z.literal('time'), time: timeSchema }),
   ]) }),
   taskOperation('disable_reminder'), taskOperation('enable_reminder'), taskOperation('get_reminder'),
+  taskOperation('modify_reminder').extend({ edit: reminderEditSchema }),
   z.strictObject({ type: z.literal('set_group_default'), rule: ruleSchema }),
-  z.strictObject({ type: z.literal('help') }), z.strictObject({ type: z.literal('clarify') }), z.strictObject({ type: z.literal('unknown') }),
+  z.strictObject({ type: z.literal('help') }),
+  z.strictObject({ type: z.literal('clarify'), question: z.enum(['task', 'time', 'day', 'mode']).optional() }),
+  z.strictObject({ type: z.literal('unknown') }),
 ])
 
 export type TaskAction = z.infer<typeof intentSchema>
 export type TargetAction = Extract<TaskAction, { target: unknown }>
+export type Clarification = NonNullable<Extract<TaskAction, { type: 'clarify' }>['question']>

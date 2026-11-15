@@ -1,5 +1,6 @@
-import type { TaskAction } from './intent'
+import type { Clarification, TaskAction } from './intent'
 import { saveOperationResult, type OperationResult } from '../line/outbox'
+import { namesTarget, taskKey } from './target-matching'
 
 export type TaskCategory = 'deadline' | 'belonging'
 export type Task = {
@@ -8,9 +9,14 @@ export type Task = {
 }
 export type TaskEvent = {
   groupId: string; userId: string; eventId: string; eventTime: number; now: number
+  text?: string
+  quoteTaskId?: number | null
+  linkTask?: boolean
   inbox?: { receiptId: number; leaseToken: string; canCommit: () => boolean }
 }
 export type TaskContext = { task_id: number | null; pending_json: string | null }
+export type PendingClarification = { kind: 'clarification'; question: Clarification; text: string; quoteTaskId?: number | null }
+export type PendingContext = PendingClarification | { kind?: never; action: unknown; ids: number[] }
 const taskListLimit = 20
 
 export async function listTasks(db: D1Database, groupId: string, action: Extract<TaskAction, { type: 'list_tasks' }>) {
@@ -25,21 +31,43 @@ export async function listTasks(db: D1Database, groupId: string, action: Extract
   return { tasks: results.slice(0, taskListLimit), truncated: results.length > taskListLimit }
 }
 
-export async function findTasks(db: D1Database, groupId: string, name: string, dueDate: string | undefined, deleted: boolean) {
+async function searchableTasks(db: D1Database, groupId: string, dueDate: string | undefined, deleted: boolean) {
   const { results } = await db.prepare(`
-    SELECT * FROM tasks WHERE group_id = ? AND (deleted_at IS NOT NULL) = ? AND instr(title, ?) > 0
-      AND (? IS NULL OR due_date = ?) ORDER BY due_date, id LIMIT 6
-  `).bind(groupId, Number(deleted), name, dueDate ?? null, dueDate ?? null).all<Task>()
-  return results
+    SELECT * FROM tasks WHERE group_id = ? AND (deleted_at IS NOT NULL) = ?
+      AND (? IS NULL OR due_date = ?) ORDER BY due_date, id LIMIT 201
+  `).bind(groupId, Number(deleted), dueDate ?? null, dueDate ?? null).all<Task>()
+  return results.length > 200 ? undefined : results
+}
+
+export async function findTasks(db: D1Database, groupId: string, name: string, dueDate: string | undefined, deleted: boolean) {
+  const tasks = await searchableTasks(db, groupId, dueDate, deleted)
+  if (!tasks) return
+  const key = taskKey(name)
+  const exact = tasks.filter((task) => task.title === name || (key.length >= 2 && taskKey(task.title) === key))
+  return (exact.length || key.length < 2 ? exact : tasks.filter((task) => namesTarget(task.title, name))).slice(0, 6)
+}
+
+export async function mentionsOtherTask(db: D1Database, groupId: string, text: string, taskId: number, deleted: boolean) {
+  const tasks = await searchableTasks(db, groupId, undefined, deleted)
+  if (!tasks || tasks.some((task) => task.id !== taskId && taskKey(task.title).length >= 2 && namesTarget(text, task.title))) return true
+  const alias = /^(?:あの)?([^、。\n]{2,25}?)のやつ/.exec(text)?.[1]
+  return !!alias && !/^(?:さっき|前|今|さきほど|例|この|その|あの)/.test(alias)
+    && !tasks.some((task) => task.id === taskId && namesTarget(task.title, alias))
 }
 
 export function getTask(db: D1Database, groupId: string, id: number) {
   return db.prepare('SELECT * FROM tasks WHERE group_id = ? AND id = ?').bind(groupId, id).first<Task>()
 }
 
-export function getQuotedTask(db: D1Database, groupId: string, messageId: string) {
-  return db.prepare(`SELECT task_id FROM reminder_occurrences WHERE group_id = ? AND line_message_id = ? AND status = 'sent'`)
-    .bind(groupId, messageId).first<number>('task_id')
+export const sentMessage = `SELECT task_id FROM operation_result_outbox WHERE group_id = ? AND line_message_id = ? AND status = 'sent'
+  UNION ALL SELECT task_id FROM reminder_occurrences WHERE group_id = ? AND line_message_id = ? AND status = 'sent'`
+
+export function getBotMessage(db: D1Database, groupId: string, messageId: string) {
+  return db.prepare(sentMessage).bind(groupId, messageId, groupId, messageId).first<{ task_id: number | null }>()
+}
+
+export function pendingContext(context: TaskContext | null) {
+  return context?.pending_json ? JSON.parse(context.pending_json) as PendingContext : null
 }
 
 export function getContext(db: D1Database, event: TaskEvent) {
@@ -85,7 +113,7 @@ async function commitEvent(db: D1Database, event: TaskEvent, changes: D1Prepared
     : db.prepare('INSERT INTO processed_events (event_id, processed_at) VALUES (?, ?)').bind(event.eventId, now)
   const completion: D1PreparedStatement[] = []
   if (inbox) {
-    if (result) completion.push(saveOperationResult(db, inbox.receiptId, result, now, failure?.startsWith('ai_') ?? false))
+    if (result) completion.push(saveOperationResult(db, inbox.receiptId, result, now, failure?.startsWith('ai_') ?? false, !!event.linkTask))
     completion.push(db.prepare(`UPDATE webhook_inbox SET status = ?, finished_at = ?, last_error = ?, input_json = NULL,
       action_json = NULL, reply_token = NULL, lease_token = NULL, lease_until = NULL WHERE receipt_id = ?`)
       .bind(failure ? 'failed' : 'succeeded', now, failure ?? null, inbox.receiptId))

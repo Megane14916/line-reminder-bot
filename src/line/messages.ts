@@ -1,4 +1,5 @@
 import type { Task, TaskCategory } from '../tasks/repository'
+import type { Clarification } from '../tasks/intent'
 import { defaultReminderOffsets, type ReminderRule } from '../tasks/schedule'
 import { daysUntil, todayInJapan } from '../tasks/validation'
 
@@ -84,7 +85,10 @@ function formatRepeat(rule: Extract<ReminderRule, { type: 'repeat' }>, startLabe
     ? through + (weekdayNames ? `（${weekdayNames}の場合）` : '')
     : `${from}から${through}まで${frequency}`
   const when = times.length === 1 ? `時刻：${times[0]}` : ['時刻：', ...times.map((slot) => `・${slot}`)].join('\n')
-  return `通知：${period}\n${when}`
+  const notes = [`通知：${period}`, when]
+  if (rule.extraSlots?.length) notes.push(formatOffsets(rule.extraSlots).replace('通知：', '追加：'))
+  if (rule.excludedSlots?.length) notes.push(formatOffsets(rule.excludedSlots).replace('通知：', '除外：'))
+  return notes.join('\n')
 }
 
 function reminderDetails({ dueDate, rule, anchor, active, next }: TaskReminder, now: number, showNext: boolean) {
@@ -127,11 +131,15 @@ export const helpMessage = [
   '✏️ タスクの変更\n「レポートの期限を12月23日に変更して」',
   '✅ タスクの完了\n「レポート終わった」',
   '🔔 通知の設定\n「レポートは1週間前から毎日20時に通知して」\n「レポートの通知は前日だけにして」',
-  '💬 通知への返信\nリマインダーを引用して「終わった」と返信すると完了できます。メンションは不要です。',
+  '💬 Botへの返信\nBotのメッセージを引用すると、メンションなしで操作できます。\n「2週間前にも通知して」「もう終わった」',
 ].join('\n\n')
 
-export function formatIntentError(needsDetails = false) {
-  const prompt = needsDetails ? '操作を一つずつ、日付やタスク名を添えて送ってください。'
-    : '操作を読み取れませんでした。日付やタスク名を添えて、もう一度お試しください。'
-  return `💬 ${prompt}\n\n${helpMessage}`
+export function formatIntentError(question?: Clarification) {
+  const prompts = {
+    task: '💬 どのタスクのことですか？\nタスク名を教えてください。',
+    time: '🔔 何時に通知しましょうか？',
+    day: '🔔 何日前の通知ですか？',
+    mode: '🔔 今の通知に追加しますか？\nそれとも置き換えますか？',
+  }
+  return question ? prompts[question] : '💬 うまく読み取れませんでした。\nもう少し詳しく教えてください。'
 }
