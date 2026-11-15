@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, expect, test, vi } from 'vitest'
-import { app } from '../src/index'
+import worker, { app } from '../src/index'
 import { parseIntent } from '../src/line/intent-parser'
+import { acceptEvents, drainInbox } from '../src/line/inbox'
 import { runReminders } from '../src/reminders'
 import { testPlatform } from './platform'
 
@@ -19,7 +20,8 @@ beforeAll(async () => { platform = await testPlatform() }, 20_000)
 afterAll(async () => await platform?.dispose())
 beforeEach(async () => {
   const { DB } = platform.env
-  await DB.batch(['reminder_occurrences', 'tasks', 'task_contexts', 'processed_events', 'group_reminder_defaults']
+  await DB.batch(['reminder_occurrences', 'tasks', 'task_contexts', 'processed_events', 'group_reminder_defaults',
+    'webhook_inbox', 'webhook_group_progress']
     .map((table) => DB.prepare('DELETE FROM ' + table)))
   vi.spyOn(Date, 'now').mockReturnValue(now)
   infer.mockReset()
@@ -28,19 +30,23 @@ beforeEach(async () => {
 })
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks() })
 
-async function webhook(events: unknown[], options: { raw?: string; tampered?: boolean; missing?: boolean } = {}) {
+function webhookEnv() {
+  return { ...platform.env, LINE_CHANNEL_SECRET: secret, LINE_CHANNEL_ACCESS_TOKEN: 'test-token', AI: ai, AI_MODEL: model } as const
+}
+
+async function webhook(events: unknown[], options: { raw?: string; tampered?: boolean; missing?: boolean; work?: Promise<unknown>[] } = {}) {
   const body = options.raw ?? JSON.stringify({ events })
   const encoder = new TextEncoder()
   const key = await crypto.subtle.importKey('raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
   const mac = await crypto.subtle.sign('HMAC', key, encoder.encode(body))
   const signature = btoa(String.fromCharCode(...new Uint8Array(mac)))
-  const work: Promise<unknown>[] = []
+  const work = options.work ?? []
   const response = await app.request('/webhook/line', {
     method: 'POST', body: options.tampered ? body + '\\n' : body,
     headers: options.missing ? {} : { 'x-line-signature': signature },
-  }, { ...platform.env, LINE_CHANNEL_SECRET: secret, LINE_CHANNEL_ACCESS_TOKEN: 'test-token', AI: ai, AI_MODEL: model },
+  }, webhookEnv(),
   { waitUntil: (promise) => { work.push(promise) }, passThroughOnException: vi.fn(), props: {} })
-  await Promise.all(work)
+  if (!options.work) await Promise.all(work)
   return response
 }
 
@@ -70,6 +76,228 @@ function lastReply() {
 function taskRows() {
   return platform.env.DB.prepare('SELECT * FROM tasks ORDER BY id').all()
 }
+
+test.each([
+  ['update_task', 'update_task', '期限', { due_date: '2030-12-25' }],
+  ['disable_reminder', 'enable_reminder', '通知', { reminder_enabled: 1 }],
+  ['complete_task', 'reopen_task', '完了', { status: 'open' }],
+  ['delete_task', 'restore_task', '削除', { deleted_at: null }],
+] as const)('serializes %s then %s when the second result is ready first', async (earlier, later, label, expected) => {
+  await command('レポート登録', create)
+  const first = Promise.withResolvers<unknown>()
+  const second = Promise.withResolvers<unknown>()
+  const started = Promise.withResolvers<void>()
+  const work: Promise<unknown>[] = []
+  const one = event('レポートの' + label + 'を変更', { mention: true, timestamp: now + 1 })
+  const two = event(later === 'update_task' ? 'やっぱり12月25日' : 'やっぱりレポートの操作を戻して',
+    { mention: true, userId: later === 'update_task' ? 'user-a' : 'user-b', timestamp: now + 2 })
+  infer.mockImplementationOnce(() => { started.resolve(); return first.promise }).mockImplementationOnce(() => second.promise)
+  await webhook([one], { work })
+  await started.promise
+  second.resolve({ response: later === 'update_task' ? { type: later, target: recent, dueDate: '2030-12-25' }
+    : { type: later, target: byName('レポート') } })
+  await webhook([two])
+  expect(infer).toHaveBeenCalledTimes(2)
+  expect(await inbox(two.webhookEventId)).toMatchObject({ status: 'queued' })
+  first.resolve({ response: earlier === 'update_task' ? { type: earlier, target: byName('レポート'), dueDate: '2030-12-23' }
+    : { type: earlier, target: byName('レポート') } })
+  await Promise.all(work)
+  expect((await taskRows()).results).toMatchObject([expected])
+  expect(await inbox(two.webhookEventId)).toMatchObject({ status: 'succeeded', attempts: 1 })
+  expect(await inbox(one.webhookEventId)).toMatchObject({ status: 'succeeded', attempts: 1 })
+})
+
+test('rejects an older delivery after a newer update, including across users and on redelivery', async () => {
+  await command('レポート登録', create)
+  await command('レポートの締切を25日にして', { type: 'update_task', target: byName('レポート'), dueDate: '2030-12-25' },
+    { timestamp: now + 2, userId: 'user-b' })
+  const old = event('レポートを削除', { mention: true, timestamp: now + 1 })
+  await webhook([old])
+  expect(lastReply()).toContain('新しい操作')
+  await webhook([old])
+  expect(infer).toHaveBeenCalledTimes(2)
+  expect((await taskRows()).results).toMatchObject([{ due_date: '2030-12-25', deleted_at: null }])
+  expect(await inbox(old.webhookEventId)).toMatchObject({ status: 'failed', last_error: 'out_of_order', attempts: 1 })
+})
+
+test('uses D1 receipt order to break equal LINE timestamps, independent of event ID text', async () => {
+  await command('レポート登録', create)
+  const first = event('レポートを23日締切に', { mention: true, id: 'z-first', timestamp: now + 5 })
+  const second = event('レポートを25日締切に', { mention: true, id: 'a-second', timestamp: now + 5 })
+  infer.mockResolvedValueOnce({ response: { type: 'update_task', target: byName('レポート'), dueDate: '2030-12-23' } })
+    .mockResolvedValueOnce({ response: { type: 'update_task', target: byName('レポート'), dueDate: '2030-12-25' } })
+  await webhook([first, second])
+  expect((await taskRows()).results).toMatchObject([{ due_date: '2030-12-25' }])
+  expect(Number((await inbox(first.webhookEventId))?.receipt_id)).toBeLessThan(Number((await inbox(second.webhookEventId))?.receipt_id))
+})
+
+test('recovers a saved operation from Cron and expires an old abandoned attempt', async () => {
+  const { DB } = platform.env
+  const old = event('レポート登録', { mention: true })
+  infer.mockRejectedValueOnce(new Error('test'))
+  await webhook([old])
+  await DB.prepare(`UPDATE webhook_inbox SET status = 'running', lease_until = ? WHERE event_id = ?`)
+    .bind(now + 45_000, old.webhookEventId).run()
+
+  const current = now + 15 * 60_000
+  vi.mocked(Date.now).mockReturnValue(current)
+  const saved = event('レポート登録', { mention: true })
+  await acceptEvents(DB, [{ groupId: group, userId: 'user-a', eventId: saved.webhookEventId, eventTime: current,
+    replyToken: 'test-reply-token', input: { type: 'intent', text: 'レポート登録' } }], current)
+  infer.mockResolvedValueOnce({ response: create })
+  await worker.scheduled({ cron: '* * * * *', scheduledTime: current, noRetry: vi.fn() }, webhookEnv())
+  expect(await inbox(old.webhookEventId)).toMatchObject({ status: 'failed', last_error: 'expired', input_json: null, reply_token: null })
+  expect(await inbox(saved.webhookEventId)).toMatchObject({ status: 'succeeded', attempts: 1 })
+  expect((await taskRows()).results).toHaveLength(1)
+})
+
+test('a slow group inference leaves another group free to commit first', async () => {
+  const slow = Promise.withResolvers<unknown>()
+  const started = Promise.withResolvers<void>()
+  infer.mockImplementationOnce(() => { started.resolve(); return slow.promise }).mockResolvedValueOnce({ response: create })
+  const work: Promise<unknown>[] = []
+  const first = event('レポート登録', { mention: true })
+  const second = event('レポート登録', { mention: true, groupId: 'group-b' })
+  await webhook([first], { work })
+  await started.promise
+  await webhook([second])
+  expect((await taskRows()).results).toMatchObject([{ group_id: 'group-b' }])
+  slow.resolve({ response: create })
+  await Promise.all(work)
+  expect((await taskRows()).results).toMatchObject([{ group_id: 'group-b' }, { group_id: 'group-a' }])
+})
+
+test('keeps further events durable when the count or time budget runs out', async () => {
+  const requests = Array.from({ length: 4 }, () => event('レポート登録', { mention: true }))
+  infer.mockImplementationOnce(async () => {
+    vi.mocked(Date.now).mockReturnValue(now + 12_500)
+    return { response: create }
+  }).mockResolvedValue({ response: create })
+  await webhook(requests)
+  expect(infer).toHaveBeenCalledTimes(1)
+  expect(await inbox(requests[1].webhookEventId)).toMatchObject({ status: 'queued', attempts: 0 })
+  await tick(now + 60_000)
+  expect(infer).toHaveBeenCalledTimes(3)
+  expect(await inbox(requests[3].webhookEventId)).toMatchObject({ status: 'queued', attempts: 0 })
+  await tick(now + 120_000)
+  expect((await taskRows()).results).toHaveLength(4)
+  expect(line).toHaveBeenCalledTimes(1)
+})
+
+test('one slow LINE reply does not hold the group lease or block the next operation', async () => {
+  const pending = Promise.withResolvers<Response>()
+  const sending = Promise.withResolvers<void>()
+  line.mockImplementationOnce(() => { sending.resolve(); return pending.promise })
+  infer.mockResolvedValue({ response: create })
+  const requests = [event('レポート登録', { mention: true }), event('レポート登録', { mention: true })]
+  const work: Promise<unknown>[] = []
+  try {
+    await webhook(requests, { work })
+    await sending.promise
+    await vi.waitFor(async () => expect(await inbox(requests[1].webhookEventId)).toMatchObject({ status: 'succeeded' }))
+    expect((await taskRows()).results).toHaveLength(2)
+  } finally {
+    pending.resolve(new Response('{}'))
+    await Promise.all(work)
+  }
+})
+
+function inbox(eventId: string) {
+  return platform.env.DB.prepare('SELECT * FROM webhook_inbox WHERE event_id = ?').bind(eventId).first()
+}
+
+function tick(time: number) {
+  vi.mocked(Date.now).mockReturnValue(time)
+  return drainInbox(webhookEnv())
+}
+
+const create = { type: 'create_task', title: 'レポート', category: 'deadline', dueDate: '2030-12-20' }
+
+test('returns 503 if the Inbox cannot save an event and accepts redelivery once it can', async () => {
+  const { DB } = platform.env
+  const request = event('レポートを登録', { mention: true })
+  await DB.prepare(`CREATE TRIGGER fail_intake BEFORE INSERT ON webhook_inbox BEGIN SELECT RAISE(ABORT, 'test'); END`).run()
+  try {
+    expect((await webhook([request])).status).toBe(503)
+    expect(await inbox(request.webhookEventId)).toBeNull()
+    expect(infer).not.toHaveBeenCalled()
+  } finally {
+    await DB.prepare('DROP TRIGGER fail_intake').run()
+  }
+  infer.mockResolvedValue({ response: create })
+  expect((await webhook([request])).status).toBe(200)
+  await webhook([request])
+  expect((await taskRows()).results).toHaveLength(1)
+  expect(await inbox(request.webhookEventId)).toMatchObject({ status: 'succeeded', attempts: 1, input_json: null, reply_token: null })
+})
+
+test('resumes a partially successful delivery after D1 fails and reuses the validated intent', async () => {
+  const { DB } = platform.env
+  const first = event('レポートを登録', { mention: true })
+  const second = event('作文を登録', { mention: true, timestamp: now + 1 })
+  const third = event('宿題を登録', { mention: true, timestamp: now + 2 })
+  infer.mockResolvedValueOnce({ response: create }).mockResolvedValueOnce({ response: { ...create, title: '作文' } })
+    .mockResolvedValueOnce({ response: { ...create, title: '宿題' } })
+  await DB.prepare(`CREATE TRIGGER fail_create BEFORE INSERT ON tasks WHEN NEW.title = '作文' BEGIN SELECT RAISE(ABORT, 'test'); END`).run()
+  try {
+    expect((await webhook([first, second, third])).status).toBe(200)
+    expect(await inbox(first.webhookEventId)).toMatchObject({ status: 'succeeded' })
+    expect(await inbox(second.webhookEventId)).toMatchObject({ status: 'queued', last_error: 'd1_error', action_json: expect.stringContaining('作文') })
+    expect(await inbox(third.webhookEventId)).toMatchObject({ status: 'queued', attempts: 0 })
+    expect((await taskRows()).results).toHaveLength(1)
+  } finally {
+    await DB.prepare('DROP TRIGGER fail_create').run()
+  }
+  await webhook([first, second, third])
+  await tick(now + 15_000)
+  expect((await taskRows()).results.map(({ title }) => title)).toEqual(['レポート', '作文', '宿題'])
+  expect(infer).toHaveBeenCalledTimes(3)
+  expect(await inbox(second.webhookEventId)).toMatchObject({ status: 'succeeded', attempts: 2, action_json: null })
+  expect(await inbox(third.webhookEventId)).toMatchObject({ status: 'succeeded', attempts: 1 })
+})
+
+test('a reply timeout after commit does not repeat the reply or mutation during concurrent redelivery', async () => {
+  const request = event('レポートを登録', { mention: true })
+  infer.mockResolvedValue({ response: create })
+  const aborted = AbortSignal.abort(new DOMException('test', 'TimeoutError'))
+  vi.spyOn(AbortSignal, 'timeout').mockReturnValueOnce(aborted)
+  line.mockImplementationOnce(async (_url, options) => { throw options?.signal?.reason })
+  await Promise.all([webhook([request]), webhook([request])])
+  await webhook([request])
+  expect(line).toHaveBeenCalledTimes(1)
+  expect(infer).toHaveBeenCalledTimes(1)
+  expect((await taskRows()).results).toHaveLength(1)
+  expect(await inbox(request.webhookEventId)).toMatchObject({ status: 'succeeded', attempts: 1 })
+})
+
+test('reclaims an interrupted lease and fences off the former worker when its inference finishes', async () => {
+  const request = event('レポートを登録', { mention: true })
+  const first = Promise.withResolvers<unknown>()
+  const started = Promise.withResolvers<void>()
+  const work: Promise<unknown>[] = []
+  infer.mockImplementationOnce(() => { started.resolve(); return first.promise }).mockResolvedValueOnce({ response: create })
+  expect((await webhook([request], { work })).status).toBe(200)
+  await started.promise
+  expect(await inbox(request.webhookEventId)).toMatchObject({ status: 'running', attempts: 1 })
+  await tick(now + 45_000)
+  first.resolve({ response: { ...create, title: '古い推論' } })
+  await Promise.all(work)
+  expect((await taskRows()).results).toMatchObject([{ title: 'レポート' }])
+  expect(await inbox(request.webhookEventId)).toMatchObject({ status: 'succeeded', attempts: 2 })
+})
+
+test('stops retrying exhausted inference and scrubs the input and expired reply token', async () => {
+  const request = event('レポートを登録', { mention: true })
+  infer.mockRejectedValue(new Error('test'))
+  await webhook([request])
+  await tick(now + 15_000)
+  await tick(now + 75_000)
+  expect(await inbox(request.webhookEventId)).toMatchObject({ status: 'failed', attempts: 3, last_error: 'ai_unavailable', input_json: null, reply_token: null })
+  await tick(now + 120_000)
+  expect(infer).toHaveBeenCalledTimes(3)
+  expect(line).not.toHaveBeenCalled()
+  expect((await taskRows()).results).toEqual([])
+})
 
 test('validates signatures and empty events without invoking AI or LINE', async () => {
   expect((await webhook([])).status).toBe(200)
@@ -163,17 +391,31 @@ test.each([
   { type: 'create_task', title: 'test', category: 'deadline', dueDate: '2030-12-20', groupId: 'group-b' },
   [{ type: 'help' }, { type: 'unknown' }], '{',
 ])('validates AI output before running database actions (%j)', async (action) => {
-  await command('テスト', action)
+  const request = event('テスト', { mention: true })
+  infer.mockResolvedValueOnce({ response: action })
+  await webhook([request])
   expect((await taskRows()).results).toEqual([])
   expect(lastReply()).toMatch(/読み取れ|過去/)
+  if (lastReply()?.includes('読み取れ')) {
+    expect(await inbox(request.webhookEventId)).toMatchObject({ status: 'failed', last_error: 'invalid_intent', input_json: null, attempts: 1 })
+    await tick(now + 60_000)
+    expect(infer).toHaveBeenCalledTimes(1)
+  }
 })
 
-test('handles inference timeouts and transport failures without an action', async () => {
+test('queues a retry on inference failures and classifies inference timeout', async () => {
   infer.mockImplementationOnce(() => new Promise(() => {}))
-  await expect(parseIntent(ai, model, '今日の締切', now, 5)).resolves.toBeUndefined()
+  await expect(parseIntent(ai, model, '今日の締切', now, 5)).resolves.toEqual({ kind: 'timeout' })
+  expect(infer.mock.calls[0][2].signal.aborted).toBe(true)
   infer.mockRejectedValueOnce(new Error('network failed'))
-  await webhook([event('今日の締切', { mention: true })])
-  expect(lastReply()).toContain('読み取れません')
+  const query = event('今日の締切', { mention: true })
+  await webhook([query])
+  expect(await inbox(query.webhookEventId)).toMatchObject({ status: 'queued', last_error: 'ai_unavailable', attempts: 1 })
+  expect(line).not.toHaveBeenCalled()
+  infer.mockResolvedValueOnce({ response: { type: 'list_tasks' } })
+  await tick(now + 15_000)
+  expect(await inbox(query.webhookEventId)).toMatchObject({ status: 'succeeded', attempts: 2 })
+  expect(lastReply()).toContain('該当するタスクはありません')
 })
 
 test.each(['終わった', '完了', '✅'])('quotes an accepted push to complete once and stop future notices (%s)', async (text) => {

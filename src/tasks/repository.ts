@@ -5,7 +5,10 @@ export type Task = {
   id: number; title: string; due_date: string; category: TaskCategory; status: 'open' | 'done'; deleted_at: number | null; completed_at: number | null
   reminder_rule: string; reminder_enabled: number; reminder_anchor: number | null; reminder_version: number; created_at: number
 }
-export type TaskEvent = { groupId: string; userId: string; eventId: string; eventTime: number; now: number }
+export type TaskEvent = {
+  groupId: string; userId: string; eventId: string; eventTime: number; now: number
+  inbox?: { receiptId: number; leaseToken: string }
+}
 export type TaskContext = { task_id: number | null; pending_json: string | null }
 const taskListLimit = 20
 
@@ -56,11 +59,40 @@ export function saveContext(db: D1Database, event: TaskEvent, operation: string,
 }
 
 export async function applyEvent(db: D1Database, event: TaskEvent, ...changes: D1PreparedStatement[]) {
-  const record = db.prepare('INSERT INTO processed_events (event_id, processed_at) VALUES (?, ?)')
-    .bind(event.eventId, event.now)
+  return commitEvent(db, event, changes, true)
+}
+
+export function finishInboxEvent(db: D1Database, event: TaskEvent, advance: boolean, failure?: string) {
+  return commitEvent(db, event, [], advance, failure)
+}
+
+async function commitEvent(db: D1Database, event: TaskEvent, changes: D1PreparedStatement[], advance: boolean, failure?: string) {
+  const inbox = event.inbox
+  const now = event.now
+  // The NOT NULL constraint rolls back the batch if this invocation lost its lease.
+  const record = inbox ? db.prepare(`INSERT INTO processed_events (event_id, processed_at) VALUES ((
+    SELECT event_id FROM webhook_inbox q WHERE receipt_id = ? AND event_id = ? AND status = 'running'
+      AND lease_token = ? AND lease_until > ? AND NOT EXISTS (
+        SELECT 1 FROM webhook_inbox active WHERE active.group_id = q.group_id AND active.receipt_id <> q.receipt_id
+          AND active.status = 'running' AND active.lease_until > ?
+      ) ${advance ? `AND NOT EXISTS (
+        SELECT 1 FROM webhook_group_progress p WHERE p.group_id = q.group_id AND (p.event_time, p.receipt_id) > (q.event_time, q.receipt_id)
+      )` : ''}), ?)`)
+    .bind(inbox.receiptId, event.eventId, inbox.leaseToken, now, now, now)
+    : db.prepare('INSERT INTO processed_events (event_id, processed_at) VALUES (?, ?)').bind(event.eventId, now)
+  const completion: D1PreparedStatement[] = []
+  if (inbox) {
+    completion.push(db.prepare(`UPDATE webhook_inbox SET status = ?, finished_at = ?, last_error = ?, input_json = NULL,
+      action_json = NULL, reply_token = NULL, lease_token = NULL, lease_until = NULL WHERE receipt_id = ?`)
+      .bind(failure ? 'failed' : 'succeeded', now, failure ?? null, inbox.receiptId))
+    if (advance) completion.push(db.prepare(`INSERT INTO webhook_group_progress (group_id, event_time, receipt_id) VALUES (?, ?, ?)
+      ON CONFLICT(group_id) DO UPDATE SET event_time = excluded.event_time, receipt_id = excluded.receipt_id
+      WHERE (event_time, receipt_id) < (excluded.event_time, excluded.receipt_id)`)
+      .bind(event.groupId, event.eventTime, inbox.receiptId))
+  }
   try {
-    const [, ...results] = await db.batch([record, ...changes])
-    return results
+    const results = await db.batch([record, ...changes, ...completion])
+    return results.slice(1, changes.length + 1)
   } catch (error) {
     if (!await wasProcessed(db, event.eventId)) throw error
   }

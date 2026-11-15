@@ -7,8 +7,8 @@ type SendResult =
 
 export const pushTimeoutMs = 10_000
 
-export function sendReply(accessToken: string, replyToken: string, text: string) {
-  return postMessage('reply', accessToken, JSON.stringify({ replyToken, messages: [{ type: 'text', text }] }))
+export function sendReply(accessToken: string, replyToken: string, text: string, timeoutMs = pushTimeoutMs) {
+  return postMessage('reply', accessToken, JSON.stringify({ replyToken, messages: [{ type: 'text', text }] }), undefined, timeoutMs)
 }
 
 export function sendPush(accessToken: string, groupId: string, text: string, retryKey: string) {
@@ -16,14 +16,14 @@ export function sendPush(accessToken: string, groupId: string, text: string, ret
   return postMessage('push', accessToken, body, retryKey)
 }
 
-async function postMessage(endpoint: 'reply' | 'push', accessToken: string, body: string, retryKey?: string): Promise<SendResult> {
+async function postMessage(endpoint: 'reply' | 'push', accessToken: string, body: string, retryKey?: string, timeoutMs = pushTimeoutMs): Promise<SendResult> {
   const headers = new Headers({
     Authorization: `Bearer ${accessToken}`,
     'Content-Type': 'application/json',
   })
   if (retryKey) headers.set('X-Line-Retry-Key', retryKey)
 
-  const signal = AbortSignal.timeout(pushTimeoutMs)
+  const signal = AbortSignal.timeout(timeoutMs)
   let response: Response
   try {
     response = await fetch(`https://api.line.me/v2/bot/message/${endpoint}`, {

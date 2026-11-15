@@ -1,8 +1,5 @@
 import { Hono } from 'hono'
-import { answerSelection, clarify, dispatchAction, help } from '../tasks/actions'
-import { getQuotedTask, wasProcessed, type TaskEvent } from '../tasks/repository'
-import { sendReply } from './client'
-import { parseIntent } from './intent-parser'
+import { acceptEvents, drainInbox, type Operation } from './inbox'
 
 export const lineWebhook = new Hono<{ Bindings: Env }>()
 
@@ -26,15 +23,15 @@ lineWebhook.post('/', async (c) => {
   if (!operations.length) return c.body(null, 200)
   if (!env.LINE_CHANNEL_ACCESS_TOKEN) return c.text('Service Unavailable', 503)
 
-  // Acknowledge LINE promptly. Events from the same delivery are handled in order.
-  c.executionCtx.waitUntil(processEvents(env, operations))
+  try {
+    await acceptEvents(env.DB, operations, Date.now())
+  } catch {
+    console.error('LINE inbox intake failed', { events: operations.length })
+    return c.text('Service Unavailable', 503)
+  }
+  c.executionCtx.waitUntil(drainInbox(env).catch(() => console.error('LINE inbox drain failed')))
   return c.body(null, 200)
 })
-
-type Operation = TaskEvent & {
-  replyToken: string
-  input: { type: 'intent'; text: string } | { type: 'quote'; messageId: string } | { type: 'selection'; id: number }
-}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -51,7 +48,7 @@ function getOperation(event: unknown): Operation | undefined {
     || !isNonEmptyString(replyToken) || !isNonEmptyString(webhookEventId) || typeof timestamp !== 'number'
     || !Number.isSafeInteger(timestamp) || !isRecord(message) || message.type !== 'text' || typeof message.text !== 'string') return
 
-  const context = { replyToken, groupId: source.groupId, userId: source.userId, eventId: webhookEventId, eventTime: timestamp, now: Date.now() }
+  const context = { replyToken, groupId: source.groupId, userId: source.userId, eventId: webhookEventId, eventTime: timestamp }
   const { mention, quotedMessageId } = message
   const mentionees: unknown[] = isRecord(mention) && Array.isArray(mention.mentionees) ? mention.mentionees : []
   const self = mentionees.filter((entry) => isRecord(entry) && entry.isSelf === true)
@@ -65,7 +62,7 @@ function getOperation(event: unknown): Operation | undefined {
   if (selection && Number.isSafeInteger(Number(selection[1]))) {
     return { ...context, input: { type: 'selection', id: Number(selection[1]) } }
   }
-  if (self.length) return { ...context, input: { type: 'intent', text } }
+  if (self.length) return { ...context, input: { type: 'intent', text: text.slice(0, 2001) } }
 }
 
 function stripMentions(text: string, mentions: unknown[]) {
@@ -83,53 +80,6 @@ function stripMentions(text: string, mentions: unknown[]) {
     nextStart = start
   }
   return text.trim()
-}
-
-async function processEvents(env: Env, operations: Operation[]) {
-  for (const event of operations) {
-    let reply: string | undefined
-    try {
-      reply = await handleInput(env, event)
-    } catch {
-      console.error('LINE task action failed', { eventId: event.eventId, input: event.input.type })
-      reply = '処理結果を確認できませんでした。タスク一覧で確認してください。'
-    }
-    if (reply) await deliverReply(env.LINE_CHANNEL_ACCESS_TOKEN, event, reply)
-  }
-}
-
-async function deliverReply(accessToken: string, event: Operation, reply: string) {
-  const context = { input: event.input.type, eventId: event.eventId }
-  try {
-    const result = await sendReply(accessToken, event.replyToken, reply)
-    if (!result.ok) {
-      const status = result.kind === 'http' ? { status: result.status } : {}
-      console.error('LINE reply failed', { ...context, kind: result.kind, ...status })
-    }
-  } catch {
-    console.error('LINE reply failed', { ...context, kind: 'unexpected' })
-  }
-}
-
-async function handleInput({ DB, AI, AI_MODEL }: Env, event: Operation) {
-  const { input } = event
-  if (input.type === 'intent' && !input.text) return help
-  if (await wasProcessed(DB, event.eventId)) return
-  if (input.type === 'quote') {
-    const id = await getQuotedTask(DB, event.groupId, input.messageId)
-    if (id) return dispatchAction(DB, event, { type: 'complete_task', target: { by: 'id', id } })
-    return
-  }
-  if (input.type === 'selection') return answerSelection(DB, event, input.id)
-
-  const action = await parseIntent(AI, AI_MODEL, input.text, event.now)
-  if (!action) return '操作を読み取れませんでした。日付やタスク名を添えて、もう一度お試しください。'
-  if ('target' in action) {
-    if (action.target.by === 'id' && !new RegExp('#' + action.target.id + '(?!\\d)').test(input.text.normalize('NFKC'))) return clarify
-    if (action.target.by === 'name' && !input.text.includes(action.target.name)) return clarify
-    if (action.target.by === 'recent' && !action.type.includes('reminder') && !/さっき|やっぱり|このタスク|そのタスク|前のタスク|今のタスク/.test(input.text)) return clarify
-  }
-  return dispatchAction(DB, event, action)
 }
 
 async function verifySignature(secret: string, header: string, body: ArrayBuffer) {
