@@ -1,8 +1,9 @@
 import { intentSchema, type TaskAction } from '../tasks/intent'
-import { answerSelection, clarify, dispatchAction, help } from '../tasks/actions'
+import { answerSelection, dispatchAction } from '../tasks/actions'
 import { finishInboxEvent, getQuotedTask, wasProcessed, type TaskEvent } from '../tasks/repository'
 import { aiTimeout, runtimeBudget, type RuntimeBudget } from '../runtime-budget'
 import { parseIntent } from './intent-parser'
+import { formatIntentError, helpMessage } from './messages'
 import { drainResults, expiredOperationResults, failedInference, unknownOperation } from './outbox'
 
 export type Input = { type: 'intent'; text: string } | { type: 'quote'; messageId: string } | { type: 'selection'; id: number }
@@ -110,7 +111,7 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
       const id = await getQuotedTask(db, event.groupId, input.messageId)
       if (id) action = { type: 'complete_task', target: { by: 'id', id } }
     } else if (!input.text) {
-      reply = help
+      reply = helpMessage
     } else {
       if (row.action_json) action = intentSchema.parse(JSON.parse(row.action_json))
       else {
@@ -134,7 +135,7 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
       }
       if (!action || action.type === 'unknown' || action.type === 'clarify') {
         failure = 'invalid_intent'
-        reply = action?.type === 'clarify' ? clarify : '操作を読み取れませんでした。日付やタスク名を添えて、もう一度お試しください。'
+        reply = formatIntentError(action?.type === 'clarify')
         action = undefined
       }
     }

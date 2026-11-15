@@ -529,8 +529,13 @@ test('replies to a bot-only mention with text and ignores conversation, other me
   }, old])
   expect(line).not.toHaveBeenCalled()
   await webhook([event('', { mention: true })])
-  expect(lastReply()).toContain('Bot にメンションして')
+  const help = lastReply()
+  expect(help).toMatch(/^📖 Botの使い方\n\nBotをメンションして/)
+  expect(help).toContain('\n\n📝 タスクの登録\n「12月20日までにレポート提出」\n\n📋 タスクの確認')
+  expect(help).toContain('メンションは不要です。')
   expect(infer).not.toHaveBeenCalled()
+  expect(await command('使い方を教えて', { type: 'help' })).toBe(help)
+  expect(await command('分からない操作', { type: 'unknown' })).toMatch(/読み取れませんでした。[^\n]+\n\n📖 Botの使い方/)
 })
 
 test('creates and deduplicates a related create-and-reminder request and lists by date and category', async () => {
@@ -544,22 +549,27 @@ test('creates and deduplicates a related create-and-reminder request and lists b
   expect(infer).toHaveBeenCalledTimes(1)
   expect(infer.mock.calls[0][1]).toMatchObject({ messages: [expect.anything(), { role: 'user', content: '12月20日のレポートを登録。1週間前から毎日通知して' }],
     response_format: { type: 'json_object' } })
-  expect(lastReply()).toContain('登録しました')
+  expect(lastReply()).toBe('✅ タスクを登録しました\n\nレポート\n期限：12月20日（金）\n種類：提出物\n通知：7日前から前日まで毎日\n時刻：20:00')
   expect((await taskRows()).results).toMatchObject([{ reminder_rule: JSON.stringify(rule), next_reminder_at: Date.parse('2030-12-13T20:00:00+09:00') }])
-  expect(await command('12月の提出物', { type: 'list_tasks', from: '2030-12-01', to: '2030-12-31', category: 'deadline' })).toContain('レポート')
+  expect(await command('12月の提出物', { type: 'list_tasks', from: '2030-12-01', to: '2030-12-31', category: 'deadline' }))
+    .toBe('📋 未完了のタスク（1件）\n\nレポート\n期限：12月20日（金）｜提出物')
 })
 
 test('updates, completes, reopens, logically deletes, restores and manages notifications through recent context', async () => {
   await command('12月20日までにレポート提出', { type: 'create_task', title: 'レポート', category: 'deadline', dueDate: '2030-12-20' })
   expect(await command('レポートを作文に変えて12月23日締切', { type: 'update_task', target: byName('レポート'),
-    title: '作文', dueDate: '2030-12-23' })).toContain('2030-12-23')
+    title: '作文', dueDate: '2030-12-23' })).toBe('✏️ タスクを変更しました\n\n作文\n期限：12月23日（月）\n種類：提出物\n通知：7日前・前日 20:00')
   expect(await command('やっぱり3日前と前日だけ', { type: 'set_reminder', target: recent, setting: { by: 'rule',
-    rule: { type: 'offsets', slots: [{ daysBefore: 3, time: '20:00' }, { daysBefore: 1, time: '20:00' }] } } })).toContain('2030-12-20')
+    rule: { type: 'offsets', slots: [{ daysBefore: 3, time: '20:00' }, { daysBefore: 1, time: '20:00' }] } } }))
+    .toContain('通知：3日前・前日 20:00\n次回：12月20日（金）20:00')
   expect(await command('通知時間を21時に変えて', { type: 'set_reminder', target: recent,
     setting: { by: 'time', time: '21:00' } })).toContain('21:00')
-  expect(await command('このタスクはいつ通知？', { type: 'get_reminder', target: recent })).toContain('2030-12-22 21:00')
-  await command('通知停止', { type: 'disable_reminder', target: recent })
+  expect(await command('このタスクはいつ通知？', { type: 'get_reminder', target: recent }))
+    .toBe('🔔 通知設定\n\n作文\n期限：12月23日（月）\n通知：3日前・前日 21:00\n次回：12月20日（金）21:00')
+  expect(await command('通知停止', { type: 'disable_reminder', target: recent })).toContain('\n通知：停止中')
   expect((await taskRows()).results[0].next_reminder_at).toBeNull()
+  expect(await command('作文を持ち物に変えて', { type: 'update_task', target: byName('作文'), category: 'belonging' }))
+    .toBe('✏️ タスクを変更しました\n\n作文\n期限：12月23日（月）\n種類：持ち物\n通知：停止中')
   await command('通知を再開', { type: 'enable_reminder', target: recent })
   expect((await taskRows()).results[0].next_reminder_at).toBe(Date.parse('2030-12-20T21:00:00+09:00'))
   await command('作文終わった', { type: 'complete_task', target: byName('作文') })
@@ -576,9 +586,10 @@ test('keeps ambiguous selection scoped to the initiating user and group', async 
   for (const dueDate of ['2030-12-20', '2030-12-23']) {
     await command('水筒を登録', { type: 'create_task', title: '水筒', category: 'belonging', dueDate })
   }
-  expect(await command('水筒完了', { type: 'complete_task', target: byName('水筒') })).toContain('どのタスク')
   const [first, second] = (await taskRows()).results
   const token = '#' + second.id
+  expect(await command('水筒完了', { type: 'complete_task', target: byName('水筒') }))
+    .toContain(`選択用の番号を、#も付けてメンションなしで送ってください。\n\n#${first.id} 水筒\n期限：12月20日（金）｜持ち物\n\n${token} 水筒`)
   await webhook([event(token, { userId: 'user-b' }), event(token, { groupId: 'group-b' })])
   expect((await taskRows()).results).toMatchObject([{ status: 'open' }, { status: 'open' }])
   await webhook([event(token)])
@@ -591,10 +602,44 @@ test('uses a group default only for subsequently registered tasks in that group'
   const task = { type: 'create_task', title: '提出物', category: 'deadline', dueDate: '2030-12-20' }
   await command('提出物登録', task)
   const rule = { type: 'offsets', slots: [{ daysBefore: 1, time: '21:00' }] }
-  await command('今後登録するタスクは前日21時', { type: 'set_group_default', rule })
+  expect(await command('今後登録するタスクは前日21時', { type: 'set_group_default', rule }))
+    .toBe('🔔 今後登録するタスクの通知設定を変更しました\n\n通知：前日 21:00')
   await command('提出物登録', task)
   await command('提出物登録', task, { groupId: 'group-b' })
   expect((await taskRows()).results.map((row) => JSON.parse(String(row.reminder_rule)))).toEqual([{ type: 'default' }, rule, { type: 'default' }])
+})
+
+test('lists 20 ordered tasks without IDs and fits the LINE limit with legacy titles', async () => {
+  const { DB } = platform.env
+  const longTitle = '🏃'.repeat(100)
+  await DB.batch(Array.from({ length: 21 }, (_, index) => DB.prepare(`INSERT INTO tasks
+    (group_id, category, title, due_date, created_by, created_at) VALUES (?, ?, ?, ?, 'user-a', ?)`)
+    .bind(group, index === 20 ? 'belonging' : 'deadline',
+      index === 20 ? '水筒\r\n（予備）\u2028🧊' : index === 19 ? '最後のタスク' : longTitle,
+      index === 20 ? '2030-12-20' : index === 19 ? '2030-12-22' : '2030-12-21', now)))
+  const list = await command('未完了のタスクを教えて', { type: 'list_tasks' })
+  expect(list).toBeDefined()
+  const blocks = list!.split('\n\n')
+  expect(blocks[0]).toBe('📋 未完了のタスク（20件）')
+  expect(blocks.slice(1, -1)).toEqual([
+    '水筒 （予備） 🧊\n期限：12月20日（金）｜持ち物',
+    ...Array<string>(19).fill(`${longTitle}\n期限：12月21日（土）｜提出物`),
+  ])
+  expect(blocks.at(-1)).toBe('最初の20件を表示しています。')
+  expect(list).not.toMatch(/#\d+/)
+  expect(list!.length).toBeLessThanOrEqual(5000)
+})
+
+test.each([
+  { status: 'done', operation: 'complete_task', label: '完了済み' },
+  { status: 'deleted', operation: 'delete_task', label: '削除済み' },
+])('uses the same list format for $status and keeps filtering by category', async ({ status, operation, label }) => {
+  await command('レポートを登録', create)
+  await command('レポートを操作', { type: operation, target: byName('レポート') })
+  expect(await command('該当する提出物', { type: 'list_tasks', status, category: 'deadline' }))
+    .toBe(`📋 ${label}のタスク（1件）\n\nレポート\n期限：12月20日（金）｜提出物`)
+  expect(await command('該当する持ち物', { type: 'list_tasks', status, category: 'belonging' }))
+    .toBe('該当するタスクはありません。')
 })
 
 test.each([
@@ -638,6 +683,9 @@ test.each(['終わった', '完了', '✅'])('quotes an accepted push to complet
     ? new Response('{"sentMessages":[{"id":987654321012345678}]}') : new Response('{}'))
   const env = { ...platform.env, LINE_CHANNEL_ACCESS_TOKEN: 'test-token' }
   await runReminders(env, () => slot)
+  expect(pushes()).toMatchObject([{ body: { messages: [
+    { type: 'text', text: '🔔 リマインダー\n\n水筒\n期限：12月20日（金）\n締切まであと7日' },
+  ] } }])
   expect((await platform.env.DB.prepare('SELECT * FROM reminder_occurrences').first())).toMatchObject({ line_message_id: '987654321012345678' })
   await webhook([event('ありがとう', { quote: '987654321012345678' }), event(text, { quote: '987654321012345678', groupId: 'group-b' })])
   expect((await taskRows()).results[0].status).toBe('open')

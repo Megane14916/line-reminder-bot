@@ -1,7 +1,8 @@
 import { pushTimeoutMs, retryDelay, sendPush } from './line/client'
+import { formatReminderMessage } from './line/messages'
 import { lineTimeout, runtimeBudget, type RuntimeBudget } from './runtime-budget'
 import { reminderSlots, ruleSchema } from './tasks/schedule'
-import { daysUntil, todayInJapan } from './tasks/validation'
+import { todayInJapan } from './tasks/validation'
 
 const minute = 60_000
 const freshness = 60 * minute
@@ -76,9 +77,7 @@ async function enqueue(db: D1Database, task: ScheduledTask, now: number) {
     return
   }
 
-  const days = daysUntil(task.due_date, slot)
-  const text = days === 0 ? `今日が期限です：${task.title}`
-    : days === 1 ? `明日が期限です：${task.title}` : `期限まであと${days}日です：${task.title}`
+  const text = formatReminderMessage(task.title, task.due_date, slot)
   const legacySlot = Date.parse(`${task.due_date}T20:00:00+09:00`) - 86_400_000
   const insert = db.prepare(`INSERT INTO reminder_occurrences (task_id, scheduled_at, group_id, rule_version, message_text, retry_key)
     SELECT id, ?, group_id, reminder_version, ?, ? FROM tasks WHERE ${current}

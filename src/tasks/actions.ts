@@ -1,24 +1,23 @@
+import { formatGroupReminderSettings, formatIntentError, formatReminderSettings, formatTaskCandidates,
+  formatTaskList, formatTaskMessage, formatTaskResult, helpMessage } from '../line/messages'
 import { intentSchema, type TargetAction, type TaskAction } from './intent'
 import { applyEvent, findTasks, getContext, getTask, listTasks, saveContext, type Task, type TaskEvent } from './repository'
-import { changeReminderTime, defaultRule, describeSchedule, reminderSlots, ruleSchema } from './schedule'
+import { changeReminderTime, defaultRule, reminderSlots, ruleSchema } from './schedule'
 import { todayInJapan } from './validation'
-
-export const help = 'Bot にメンションして「12月20日までにレポート提出」「来週の締切を教えて」「レポート完了」「水筒の通知は前日21時だけ」などと送ってください。通知への引用返信で「終わった」と送っても完了できます。'
-export const clarify = '操作を一つずつ、必要な日付やタスク名を添えて教えてください。'
 
 export async function dispatchAction(db: D1Database, event: TaskEvent, action: TaskAction): Promise<string | undefined> {
   switch (action.type) {
-    case 'help': return help
-    case 'unknown': return `操作を読み取れませんでした。${help}`
-    case 'clarify': return clarify
+    case 'help': return helpMessage
+    case 'unknown': return formatIntentError()
+    case 'clarify': return formatIntentError(true)
     case 'list_tasks': {
       const { tasks, truncated } = await listTasks(db, event.groupId, action)
-      return tasks.length ? `${tasks.map(taskLine).join('\n')}${truncated ? '\n最初の20件を表示しています。' : ''}` : '該当するタスクはありません。'
+      return formatTaskList(tasks, action.status, truncated, event.now)
     }
     case 'set_group_default': {
       const update = db.prepare(`INSERT INTO group_reminder_defaults (group_id, rule_json) VALUES (?, ?)
         ON CONFLICT(group_id) DO UPDATE SET rule_json = excluded.rule_json`).bind(event.groupId, JSON.stringify(action.rule))
-      const reply = '今後登録するタスクの通知設定を変更しました。'
+      const reply = formatGroupReminderSettings(action.rule)
       if (await applyEvent(db, event, reply, update)) return reply
       return
     }
@@ -36,7 +35,8 @@ async function createTask(db: D1Database, event: TaskEvent, action: Extract<Task
   const insert = db.prepare(`INSERT INTO tasks (group_id, category, title, due_date, created_by, created_at,
     reminder_rule, reminder_anchor, next_reminder_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .bind(event.groupId, action.category, action.title, action.dueDate, event.userId, event.now, JSON.stringify(rule), event.now, next)
-  const reply = `「${action.title}」を登録しました。期限 ${action.dueDate}\n通知 ${describeSchedule(rule, action.dueDate, event.now, event.now)}`
+  const reply = formatTaskResult('✅ タスクを登録しました', action.title, action.category,
+    { dueDate: action.dueDate, rule, anchor: event.now, active: true, next }, event.now)
   if (await applyEvent(db, event, reply, insert, saveContext(db, event, action.type, 'new', null, true))) return reply
 }
 
@@ -44,7 +44,7 @@ export async function answerSelection(db: D1Database, event: TaskEvent, id: numb
   const context = await getContext(db, event)
   if (!context?.pending_json) return
   const pending: { action: unknown; ids: number[] } = JSON.parse(context.pending_json)
-  if (!pending.ids.includes(id)) return '候補の #番号 を送ってください。'
+  if (!pending.ids.includes(id)) return '候補にある選択用の番号を、#も付けて送ってください。'
   const selected = intentSchema.safeParse({ ...(pending.action as object), target: { by: 'id', id } })
   if (selected.success && 'target' in selected.data) {
     const task = await getTask(db, event.groupId, id)
@@ -62,7 +62,7 @@ async function targetOperation(db: D1Database, event: TaskEvent, action: TargetA
       const options = candidates.slice(0, 5)
       const { target: _target, ...operation } = action
       const pending = JSON.stringify({ action: operation, ids: options.map(({ id }) => id) })
-      const reply = `どのタスクですか？ #番号 を送ってください。\n${options.map(taskLine).join('\n')}${candidates.length > 5 ? '\nほかにも候補があります。日付を添えると絞り込めます。' : ''}`
+      const reply = formatTaskCandidates(options, candidates.length > 5, event.now)
       if (await applyEvent(db, event, reply, saveContext(db, event, action.type, null, pending))) return reply
       return
     }
@@ -71,7 +71,7 @@ async function targetOperation(db: D1Database, event: TaskEvent, action: TargetA
     const id = target.by === 'id' ? target.id : (await getContext(db, event))?.task_id
     if (id) task = await getTask(db, event.groupId, id)
   }
-  if (!task || (task.deleted_at !== null) !== (action.type === 'restore_task')) return '該当するタスクが見つかりません。タスク名や #番号 を教えてください。'
+  if (!task || (task.deleted_at !== null) !== (action.type === 'restore_task')) return '該当するタスクが見つかりません。タスク名や期限を教えてください。'
   return changeTask(db, event, action, task, target.by === 'recent' ? { recent: task.id } : undefined)
 }
 
@@ -80,10 +80,12 @@ async function changeTask(db: D1Database, event: TaskEvent, action: TargetAction
   let rule = ruleSchema.parse(JSON.parse(task.reminder_rule))
   let anchor = task.reminder_anchor ?? task.created_at
   let { title, category, due_date: dueDate, status, deleted_at: deletedAt, reminder_enabled: enabled } = task
-  let reply: string
+  let heading: string
   switch (action.type) {
     case 'get_reminder': {
-      const reply = `「${title}」の通知 ${enabled && status === 'open' ? describeSchedule(rule, dueDate, anchor, event.now) : '停止中です。'}`
+      const active = Boolean(enabled && status === 'open' && deletedAt === null)
+      const next = active ? reminderSlots(rule, dueDate, anchor, event.now)[0] ?? null : null
+      const reply = formatReminderSettings('🔔 通知設定', title, { dueDate, rule, anchor, active, next }, event.now)
       if (await applyEvent(db, event, reply, saveContext(db, event, action.type, task.id))) return reply
       return
     }
@@ -93,25 +95,25 @@ async function changeTask(db: D1Database, event: TaskEvent, action: TargetAction
       title = action.title ?? title
       category = action.category ?? category
       dueDate = action.dueDate ?? dueDate
-      reply = `「${title}」を変更しました。期限 ${dueDate}${action.dueDate ? '\n通知 ' + (enabled && status === 'open' ? describeSchedule(rule, dueDate, anchor, event.now) : '停止中です。') : ''}`
+      heading = '✏️ タスクを変更しました'
       break
     case 'complete_task':
-      if (status === 'done') return `「${title}」は完了済みです。`
+      if (status === 'done') return formatTaskMessage('✅ このタスクは完了済みです', title)
       status = 'done'
-      reply = `「${title}」を完了にしました。`
+      heading = '✅ タスクを完了にしました'
       break
     case 'reopen_task':
-      if (status === 'open') return `「${title}」は未完了です。`
+      if (status === 'open') return formatTaskMessage('↩️ このタスクは未完了です', title)
       status = 'open'
-      reply = `「${title}」の完了を取り消しました。`
+      heading = '↩️ タスクの完了を取り消しました'
       break
     case 'delete_task':
       deletedAt = event.now
-      reply = `「${title}」を削除しました。`
+      heading = '🗑️ タスクを削除しました'
       break
     case 'restore_task':
       deletedAt = null
-      reply = `「${title}」を復元しました。`
+      heading = '↩️ タスクを復元しました'
       break
     case 'set_reminder':
       if (action.setting.by === 'time') rule = changeReminderTime(rule, action.setting.time, dueDate, anchor)
@@ -120,18 +122,24 @@ async function changeTask(db: D1Database, event: TaskEvent, action: TargetAction
         anchor = event.now
       }
       enabled = 1
-      reply = `「${title}」の通知を変更しました。\n${status === 'open' ? describeSchedule(rule, dueDate, anchor, event.now) : '完了を取り消すと通知が再開します。'}`
+      heading = '🔔 通知設定を変更しました'
       break
     case 'disable_reminder':
       enabled = 0
-      reply = `「${title}」の通知を停止しました。`
+      heading = '🔕 通知を停止しました'
       break
     case 'enable_reminder':
       enabled = 1
-      reply = `「${title}」の通知を再開しました。`
+      heading = status === 'open' ? '🔔 通知を再開しました' : '🔔 通知設定を変更しました'
       break
   }
-  const next = enabled && status === 'open' && deletedAt === null ? reminderSlots(rule, dueDate, anchor, event.now)[0] ?? null : null
+  const active = Boolean(enabled && status === 'open' && deletedAt === null)
+  const next = active ? reminderSlots(rule, dueDate, anchor, event.now)[0] ?? null : null
+  const reminder = { dueDate, rule, anchor, active, next }
+  const reply = action.type === 'update_task' ? formatTaskResult(heading, title, category, reminder, event.now)
+    : action.type === 'set_reminder' || action.type === 'disable_reminder' || action.type === 'enable_reminder'
+      ? formatReminderSettings(heading, title, reminder, event.now)
+      : formatTaskMessage(heading, title)
   const contextGuard = context ? `AND EXISTS (SELECT 1 FROM task_contexts WHERE group_id = ? AND user_id = ?
     AND ${'pending' in context ? 'pending_json' : 'task_id'} = ? AND expires_at > ? AND updated_at <= ?)` : ''
   const update = db.prepare(`UPDATE tasks SET title = ?, category = ?, due_date = ?, status = ?, deleted_at = ?,
@@ -143,8 +151,4 @@ async function changeTask(db: D1Database, event: TaskEvent, action: TargetAction
   const unchanged = '操作結果を確認できませんでした。現在の状態を一覧で確認してください。'
   const results = await applyEvent(db, event, { changed: reply, unchanged }, update, saveContext(db, event, action.type, task.id, null, true))
   if (results) return results[0].meta.changes && results[1].meta.changes ? reply : unchanged
-}
-
-function taskLine(task: Task) {
-  return `#${task.id} ${task.due_date} ［${task.category === 'deadline' ? '期限' : '持ち物'}］${task.title}`
 }

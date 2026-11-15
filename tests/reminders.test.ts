@@ -43,7 +43,9 @@ test('sends each task once on overlapping scheduler runs and advances to the nex
   expect(fetchMock).toHaveBeenCalledTimes(2)
   expect((await rows()).results).toMatchObject([{ status: 'sent', attempt_count: 1 }, { status: 'sent', attempt_count: 1 }])
   expect(packet(0).url).toBe('https://api.line.me/v2/bot/message/push')
-  expect(JSON.parse(String(packet(0).body))).toMatchObject({ messages: [{ text: expect.stringMatching(/^期限まであと7日です：/) }] })
+  expect(JSON.parse(String(packet(0).body))).toMatchObject({
+    messages: [{ type: 'text', text: expect.stringMatching(/^🔔 リマインダー\n\n[^\n]+\n期限：12月20日（金）\n締切まであと7日$/) }],
+  })
   await run(Date.parse('2030-12-19T20:00:00+09:00'))
   expect(fetchMock).toHaveBeenCalledTimes(4)
 })
