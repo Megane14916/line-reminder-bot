@@ -27,7 +27,13 @@ Bot の通知を LINE の引用返信機能で引用し、「終わった」「�
 
 AI のタイムアウト・接続障害や D1 の処理エラーは、初回を含め最大3回、受信から最大15分まで再試行します。解釈できない入力や古い操作は再試行しません。状態を調べる場合は `webhook_inbox` の `event_id`、`status`、`attempts`、`last_error` を確認してください。処理完了時は入力と返信トークンを消去します。
 
-LINE への返信はタスク変更とは別に行います。返信は受信から50秒未満で試行するため、Cron で復旧した操作は返信が届かない場合があります。結果が見えない場合は、同じ操作を送り直す前に一覧を確認してください。[LINE の応答トークン](https://developers.line.biz/ja/reference/messaging-api/#send-reply-message)
+操作結果はタスク変更と同じ D1 バッチで Outbox に保存します。受信から50秒以内に送信時間を確保できるときは Reply を使い、期限が近い場合や LINE が Reply を明示的に拒否した場合は元のグループへの Push に切り替えます。AI の再試行を使い切った場合も Push で再操作を案内します。結果が不明な場合は、タスク一覧で確認するよう案内します。[LINE の応答トークン](https://developers.line.biz/ja/reference/messaging-api/#send-reply-message)
+
+Reply がタイムアウトした場合や送信中に Worker が停止した場合、すでに届いた可能性があるため自動で Push に切り替えません。Push は同じ本文と Retry Key を使い、確定から1時間以内に最大4回試行します。429 は最低15分と `Retry-After` の長い方を待ちます。LINE の受理は端末への到達を保証しません。通知が見えない場合は、操作を送り直す前に一覧を確認してください。[LINE の再試行仕様](https://developers.line.biz/ja/docs/messaging-api/retrying-api-request/)
+
+毎分の Cron が Inbox、結果通知、予定リマインダーを処理します。Webhook のバックグラウンド処理と Cron はそれぞれ25秒の予算を持ち、残り時間が少なければ後続の操作・通知を次回に回します。推論・LINE API の上限は `AI_TIMEOUT_MS`（最大12,000ミリ秒）と `LINE_TIMEOUT_MS`（最大10,000ミリ秒）で個別に短縮できます。D1 への処理中に中断された場合は、処理権の期限後に再開します。
+
+確認時は `webhook_inbox` の `event_id`、`status`、`attempts`、`last_error` と、`operation_result_outbox` の `status`、`channel`、`push_attempts`、`available_at`、`last_error` を照合します。結果通知が終端状態になった時点で本文と Reply Token を消去し、送信管理に必要なメタデータを残します。
 
 ## 通知ルール
 
@@ -63,5 +69,5 @@ npx.cmd wrangler deploy --dry-run
 ## 設定と本番反映
 
 - `wrangler.jsonc` の `ai.binding` は `AI`、`vars.AI_MODEL` の初期値は `@cf/qwen/qwen3-30b-a3b-fp8` です。日本語と JSON 出力をサポートする Workers AI モデルを指定してください。Workers AI バインディングはアカウントに紐づき、専用の API キーを Worker に置く必要はありません。ローカルで実推論を試す場合は Workers AI を利用できるアカウントで `npx.cmd wrangler login` してください。[モデル仕様](https://developers.cloudflare.com/workers-ai/models/qwen3-30b-a3b-fp8/)
-- 承認後、`wrangler.jsonc` の D1 ID を実際のものに置き換え、`npx.cmd wrangler d1 migrations apply DB --remote` で `0005` までの未適用分を適用します。既存のタスク・送信履歴は保持されます。新バージョンで旧2本の Cron が無効になり、毎分 Cron が有効になったことを確認します。移行前に旧方式で同日の前日通知が受理されたか不明な場合も、重複防止のため同じ前日20時の枠をスキップします。
+- 承認後、`wrangler.jsonc` の D1 ID を実際のものに置き換え、`npx.cmd wrangler d1 migrations apply DB --remote` で `0006` までの未適用分を適用します。ローカルでは `npx.cmd wrangler d1 migrations apply DB --local` を使います。既存のタスク・送信履歴は保持されます。新バージョンで旧2本の Cron が無効になり、毎分 Cron が有効になったことを確認します。移行前に旧方式で同日の前日通知が受理されたか不明な場合も、重複防止のため同じ前日20時の枠をスキップします。
 - LINE Secrets を Git 管理外の `.env.production` に設定して `npx.cmd wrangler deploy --secrets-file .env.production` で手動反映します。テストグループで登録・通知・引用返信を確認後、家族グループで使います。通知の通数は LINE のプラン、推論は Workers AI の利用量に応じます。[LINE の料金](https://developers.line.biz/ja/docs/messaging-api/pricing/) · [Workers AI 料金](https://developers.cloudflare.com/workers-ai/platform/pricing/)
