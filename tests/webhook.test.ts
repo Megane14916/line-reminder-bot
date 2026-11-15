@@ -120,6 +120,18 @@ test('rejects an older delivery after a newer update, including across users and
   expect(await inbox(old.webhookEventId)).toMatchObject({ status: 'failed', last_error: 'out_of_order', attempts: 1 })
 })
 
+test('ignores an old unrelated quote or a selection-shaped chat after a newer mutation', async () => {
+  await command('レポート登録', create, { timestamp: now + 2 })
+  line.mockClear()
+  await webhook([
+    event('終わった', { quote: '123456', timestamp: now + 1 }),
+    event('#42', { timestamp: now + 1 }),
+  ])
+  expect(line).not.toHaveBeenCalled()
+  expect(infer).toHaveBeenCalledTimes(1)
+  expect((await taskRows()).results).toMatchObject([{ status: 'open' }])
+})
+
 test('uses D1 receipt order to break equal LINE timestamps, independent of event ID text', async () => {
   await command('レポート登録', create)
   const first = event('レポートを23日締切に', { mention: true, id: 'z-first', timestamp: now + 5 })
@@ -243,6 +255,7 @@ test('resumes a partially successful delivery after D1 fails and reuses the vali
     expect((await webhook([first, second, third])).status).toBe(200)
     expect(await inbox(first.webhookEventId)).toMatchObject({ status: 'succeeded' })
     expect(await inbox(second.webhookEventId)).toMatchObject({ status: 'queued', last_error: 'd1_error', action_json: expect.stringContaining('作文') })
+    expect(await DB.prepare('SELECT event_id FROM processed_events WHERE event_id = ?').bind(second.webhookEventId).first()).toBeNull()
     expect(await inbox(third.webhookEventId)).toMatchObject({ status: 'queued', attempts: 0 })
     expect((await taskRows()).results).toHaveLength(1)
   } finally {

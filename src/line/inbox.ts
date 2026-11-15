@@ -90,14 +90,16 @@ function claim(db: D1Database, groupId: string, token: string, now: number) {
 async function processEvent(env: Env, row: Claimed, event: InboxEvent, clock: () => number) {
   const db = env.DB
   try {
+    const input: Input = JSON.parse(row.input_json)
     const stale = await db.prepare(`SELECT 1 AS stale FROM webhook_group_progress WHERE group_id = ?
       AND (event_time, receipt_id) > (?, ?)`).bind(event.groupId, event.eventTime, row.receipt_id).first()
     if (stale) {
-      if (await finishInboxEvent(db, event, false, 'out_of_order')) return '先に新しい操作が反映されたため、古い操作は保留せず終了しました。必要ならもう一度送ってください。'
+      if (await finishInboxEvent(db, event, false, 'out_of_order') && input.type === 'intent' && input.text) {
+        return '先に新しい操作が反映されたため、古い操作は反映されませんでした。必要ならもう一度送ってください。'
+      }
       return
     }
 
-    const input: Input = JSON.parse(row.input_json)
     let action: TaskAction | undefined
     let reply: string | undefined
     let failure: string | undefined
