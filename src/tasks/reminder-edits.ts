@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { changeReminderTime, defaultReminderOffsets, jstMidnight, offset, reminderSlots, ruleSchema, slotSchema, slotTime,
+import { absoluteReminders, changeReminderTime, defaultReminderOffsets, jstMidnight, offset, reminderSlots, ruleSchema, slotSchema, slotTime,
   timeSchema, type ReminderRule, type ReminderSlot } from './schedule'
 import { todayInJapan } from './validation'
 
@@ -42,18 +42,22 @@ export function editReminder(rule: ReminderRule, edit: Edit, dueDate: string, an
       if (!matches.length) return { kind: 'missing' }
       if (matches.length > 1) return { kind: daysBefore === undefined ? 'ask_day' : 'ask_time' }
       const slots = current.filter((slot) => !sameSlot(slot, matches[0]))
-      return slots.length ? changed({ type: 'offsets', slots }) : stopped
+      const absoluteSlots = absoluteReminders(rule)
+      return slots.length || absoluteSlots.length ? changed({ type: 'offsets', slots, ...(absoluteSlots.length ? { absoluteSlots } : {}) }) : stopped
     }
     const additions = edit.mode === 'add' ? edit.slots : current.map(({ daysBefore }) => ({ daysBefore, time: edit.time }))
     const slots = uniqueSlots([...current, ...additions])
-    return slots.length === current.length ? { kind: 'duplicate' } : changed({ type: 'offsets', slots })
+    const absoluteSlots = absoluteReminders(rule)
+    return slots.length === current.length ? { kind: 'duplicate' } : changed({ type: 'offsets', slots,
+      ...(absoluteSlots.length ? { absoluteSlots } : {}) })
   }
 
   const extras = rule.extraSlots ?? []
   const excluded = rule.excludedSlots ?? []
   const includes = (candidate: ReminderRule, slot: ReminderSlot) => {
     const at = slotTime(jstMidnight(dueDate), slot)
-    return reminderSlots(candidate, dueDate, anchor, at - 1)[0] === at
+    const relative = candidate.type === 'default' ? candidate : { ...candidate, absoluteSlots: [] }
+    return reminderSlots(relative, dueDate, anchor, at - 1)[0] === at
   }
   if (edit.mode === 'add') {
     const additions = edit.slots.filter((slot) => !includes(rule, slot))
@@ -83,7 +87,11 @@ export function editReminder(rule: ReminderRule, edit: Edit, dueDate: string, an
     if (!recurring && !extraMatches.length) return { kind: 'missing' }
     const times = rule.times.filter((value) => value !== time)
     const extraSlots = extras.filter((slot) => slot.time !== time)
-    if (!times.length) return extraSlots.length ? changed({ type: 'offsets', slots: extraSlots }) : stopped
+    if (!times.length) {
+      const absoluteSlots = absoluteReminders(rule)
+      return extraSlots.length || absoluteSlots.length
+        ? changed({ type: 'offsets', slots: extraSlots, ...(absoluteSlots.length ? { absoluteSlots } : {}) }) : stopped
+    }
     return remaining({ ...rule, times, extraSlots, excludedSlots: excluded.filter((slot) => slot.time !== time) })
   }
   const matches = uniqueSlots([...rule.times.map((value) => ({ daysBefore, time: value })), ...extras])

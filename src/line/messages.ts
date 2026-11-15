@@ -1,5 +1,6 @@
 import type { Task, TaskCategory } from '../tasks/repository'
 import type { Clarification } from '../tasks/intent'
+import type { NotificationChange, NotificationSlot } from '../tasks/notification-plan'
 import { defaultReminderOffsets, type ReminderRule } from '../tasks/schedule'
 import { daysUntil, todayInJapan } from '../tasks/validation'
 
@@ -80,7 +81,7 @@ function formatRepeat(rule: Extract<ReminderRule, { type: 'repeat' }>, startLabe
   const days = [...new Set(rule.weekdays)].sort((a, b) => (a + 6) % 7 - (b + 6) % 7)
   const weekdayNames = days.map((day) => weekdays[day] + '曜日').join('・')
   const frequency = days.length ? `毎週${weekdayNames}`
-    : rule.everyDays === 1 ? '毎日' : `${rule.everyDays}日おき`
+    : rule.everyDays === 1 ? '毎日' : rule.everyDays === 7 ? '毎週' : `${rule.everyDays}日おき`
   const period = rule.startDaysBefore === rule.endDaysBefore
     ? through + (weekdayNames ? `（${weekdayNames}の場合）` : '')
     : `${from}から${through}まで${frequency}`
@@ -93,11 +94,25 @@ function formatRepeat(rule: Extract<ReminderRule, { type: 'repeat' }>, startLabe
 
 function reminderDetails({ dueDate, rule, anchor, active, next }: TaskReminder, now: number, showNext: boolean) {
   if (!active) return '通知：停止中'
-  const summary = rule.type === 'repeat' ? formatRepeat(rule, '設定日')
+  let summary = rule.type === 'repeat' ? formatRepeat(rule, '設定日')
     : formatOffsets(rule.type === 'default' ? defaultReminderOffsets(dueDate, anchor) : rule.slots)
+  if (rule.type !== 'default' && rule.absoluteSlots?.length) {
+    const dates = rule.absoluteSlots.map((slot) => `・${formatTaskDate(slot.date, now)} ${slot.time}`).join('\n')
+    summary = (rule.type === 'offsets' && !rule.slots.length ? '通知：\n' : summary + '\n指定日：\n') + dates
+  }
   if (next === null) return `${summary}\n今後の通知予定はありません。`
   if (!showNext) return summary
   return `${summary}\n次回：${formatTaskDate(todayInJapan(next), now)}${time.format(next)}`
+}
+
+export function formatNotificationChanges(changes: NotificationChange[], now: number) {
+  const label = (slot: NotificationSlot) => `${slot.kind === 'relative' ? offsetLabel(slot.daysBefore) : formatTaskDate(slot.date, now)} ${slot.time}`
+  const lines = changes.map(({ before, after, summary }) => {
+    if (summary) return summary
+    if (before && after) return `変更：${label(before)} → ${label(after)}`
+    return before ? `削除：${label(before)}` : after ? `追加：${label(after)}` : ''
+  })
+  return '\n\n' + lines.join('\n')
 }
 
 export function formatTaskResult(heading: string, title: string, category: TaskCategory, reminder: TaskReminder, now: number) {
@@ -119,7 +134,8 @@ export function formatGroupReminderSettings(rule: ReminderRule) {
 
 export function formatReminderMessage(title: string, dueDate: string, slot: number) {
   const days = daysUntil(dueDate, slot)
-  const countdown = days === 0 ? '今日が締切です' : days === 1 ? '明日が締切です' : `締切まであと${days}日`
+  const countdown = days === 0 ? '今日が締切です' : days === 1 ? '明日が締切です'
+    : days < 0 ? `締切から${-days}日経ちました` : `締切まであと${days}日`
   return `${formatTaskMessage('🔔 リマインダー', title)}\n期限：${formatTaskDate(dueDate, slot)}\n${countdown}`
 }
 

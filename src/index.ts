@@ -4,6 +4,7 @@ import { drainInbox } from './line/inbox'
 import { drainResults } from './line/outbox'
 import { reminderCron, runReminders } from './reminders'
 import { runtimeBudget, withinBudget } from './runtime-budget'
+import { expireConversation } from './tasks/conversation'
 
 export const app = new Hono<{ Bindings: Env }>()
 
@@ -16,8 +17,9 @@ export default {
     if (controller.cron !== reminderCron) return
     const budget = runtimeBudget()
     await withinBudget(budget, async () => {
-      const jobs = ['inbox', 'outbox', 'reminders']
-      const results = await Promise.allSettled([drainInbox(env, budget), drainResults(env, budget), runReminders(env, budget.clock, budget)])
+      const jobs = ['inbox', 'outbox', 'reminders', 'conversation']
+      const results = await Promise.allSettled([drainInbox(env, budget), drainResults(env, budget), runReminders(env, budget.clock, budget),
+        expireConversation(env.DB, budget.clock())])
       results.forEach((result, index) => {
         if (result.status === 'rejected') console.error('Scheduled processing failed', { job: jobs[index] })
       })

@@ -1,6 +1,7 @@
 import type { Clarification, TaskAction } from './intent'
 import { saveOperationResult, type OperationResult } from '../line/outbox'
 import { namesTarget, taskKey } from './target-matching'
+import { storeConversation, trimConversation, type ConversationEntry, type Turn } from './conversation'
 
 export type TaskCategory = 'deadline' | 'belonging'
 export type Task = {
@@ -12,6 +13,9 @@ export type TaskEvent = {
   text?: string
   quoteTaskId?: number | null
   linkTask?: boolean
+  observedTask?: { id: number; version: number }
+  history?: ConversationEntry[]
+  turn?: Partial<Omit<Turn, 'request'>> & { taskId?: number }
   inbox?: { receiptId: number; leaseToken: string; canCommit: () => boolean }
 }
 export type TaskContext = { task_id: number | null; pending_json: string | null }
@@ -45,6 +49,16 @@ export async function findTasks(db: D1Database, groupId: string, name: string, d
   const key = taskKey(name)
   const exact = tasks.filter((task) => task.title === name || (key.length >= 2 && taskKey(task.title) === key))
   return (exact.length || key.length < 2 ? exact : tasks.filter((task) => namesTarget(task.title, name))).slice(0, 6)
+}
+
+export async function mentionedTask(db: D1Database, groupId: string, text: string) {
+  const tasks = await searchableTasks(db, groupId, undefined, false)
+  const matches = tasks?.filter((task) => taskKey(task.title).length >= 2 && namesTarget(text, task.title))
+  if (matches?.length === 1) return matches[0]
+  const alias = /^(?:あの)?([^、。\n]{2,25}?)の(?:やつ|通知)/.exec(text)?.[1]
+  if (matches?.length || !alias || /^(?:さっき|前|今|さきほど|例|この|その|あの)/.test(alias)) return
+  const candidates = tasks?.filter((task) => namesTarget(task.title, alias))
+  if (candidates?.length === 1) return candidates[0]
 }
 
 export async function mentionsOtherTask(db: D1Database, groupId: string, text: string, taskId: number, deleted: boolean) {
@@ -84,7 +98,7 @@ export function saveContext(db: D1Database, event: TaskEvent, operation: string,
       pending_json = excluded.pending_json, expires_at = excluded.expires_at, updated_at = excluded.updated_at
     WHERE task_contexts.updated_at <= excluded.updated_at`)
     .bind(event.groupId, event.userId, ...(taskId === 'new' ? [] : [taskId]), operation, pending,
-      event.now + 10 * 60_000, event.eventTime)
+      event.now + (pending ? 10 : 45) * 60_000, event.eventTime)
 }
 
 export async function applyEvent(db: D1Database, event: TaskEvent, result: OperationResult, ...changes: D1PreparedStatement[]) {
@@ -114,6 +128,11 @@ async function commitEvent(db: D1Database, event: TaskEvent, changes: D1Prepared
   const completion: D1PreparedStatement[] = []
   if (inbox) {
     if (result) completion.push(saveOperationResult(db, inbox.receiptId, result, now, failure?.startsWith('ai_') ?? false, !!event.linkTask))
+    if (result && event.text && (event.turn || advance)) {
+      const { taskId, ...details } = event.turn ?? {}
+      completion.push(storeConversation(db, event, { operation: 'answer', ...details, request: event.text.slice(0, 180) }, taskId),
+        trimConversation(db, event))
+    }
     completion.push(db.prepare(`UPDATE webhook_inbox SET status = ?, finished_at = ?, last_error = ?, input_json = NULL,
       action_json = NULL, reply_token = NULL, lease_token = NULL, lease_until = NULL WHERE receipt_id = ?`)
       .bind(failure ? 'failed' : 'succeeded', now, failure ?? null, inbox.receiptId))

@@ -1,8 +1,11 @@
 import { intentSchema, type TaskAction } from '../tasks/intent'
 import { answerSelection, dispatchAction } from '../tasks/actions'
 import { askClarification, isClarificationAnswer } from '../tasks/clarification'
-import { findTasks, finishInboxEvent, getBotMessage, getContext, getTask, pendingContext, sentMessage, wasProcessed,
+import { findTasks, finishInboxEvent, getBotMessage, getContext, getTask, mentionedTask, pendingContext, sentMessage, wasProcessed,
   type TaskEvent } from '../tasks/repository'
+import { conversationHistory, notificationFocus } from '../tasks/conversation'
+import { literalNotificationEdits, validateNotificationIntent } from '../tasks/notification-dates'
+import { reminderSlots, ruleSchema } from '../tasks/schedule'
 import { cleanTargetReference, namesTarget } from '../tasks/target-matching'
 import { aiTimeout, runtimeBudget, type RuntimeBudget } from '../runtime-budget'
 import { parseIntent, quickQuotedIntent } from './intent-parser'
@@ -150,18 +153,37 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
         await finishInboxEvent(db, { ...event, now: clock() }, false)
         return
       }
+      const contextualId = event.quoteTaskId === undefined ? context?.task_id : event.quoteTaskId
+      const [history, named] = await Promise.all([conversationHistory(db, event),
+        quote ? Promise.resolve(undefined) : mentionedTask(db, event.groupId, event.text)])
+      event.history = history
+      const contextualTask = named ?? (contextualId ? await getTask(db, event.groupId, contextualId) : null)
+      if (contextualTask) event.observedTask = { id: contextualTask.id, version: contextualTask.reminder_version }
       const quick = quote?.task_id && !original ? quickQuotedIntent(text) : undefined
+      const literal = contextualTask && !original ? literalNotificationEdits(text, event.eventTime) : undefined
       if (quick && quote?.task_id) {
         action = { ...quick, target: { by: 'id', id: quote.task_id } }
       } else if (row.action_json) {
-        action = intentSchema.parse(JSON.parse(row.action_json))
+        const saved = JSON.parse(row.action_json)
+        if (saved.action) event.observedTask = saved.observedTask
+        action = intentSchema.parse(saved.action ?? saved)
+      } else if (literal && contextualTask) {
+        action = intentSchema.parse({ type: 'edit_notifications',
+          target: { by: 'id', id: contextualTask.id }, edits: literal })
       } else {
-        const contextualId = event.quoteTaskId === undefined ? context?.task_id : event.quoteTaskId
-        const contextualTask = contextualId ? await getTask(db, event.groupId, contextualId) : null
+        const rule = contextualTask ? ruleSchema.parse(JSON.parse(contextualTask.reminder_rule)) : undefined
         const timeout = Math.min(aiTimeout(env), budget.remaining() - 3000)
         if (timeout <= 0) return
         const parsed = await parseIntent(env.AI, env.AI_MODEL, event.text, event.eventTime, timeout, {
-          quoted: !!quote, task: contextualTask ? { title: contextualTask.title, dueDate: contextualTask.due_date } : undefined,
+          quoted: !!quote, question: original && pending?.kind === 'clarification' ? pending.question : undefined,
+          recentConversation: history.length ? history : undefined,
+          task: contextualTask && rule ? { id: contextualTask.id, title: contextualTask.title, dueDate: contextualTask.due_date,
+            status: contextualTask.deleted_at !== null ? 'deleted' : contextualTask.status, reminderEnabled: !!contextualTask.reminder_enabled,
+            rule, version: contextualTask.reminder_version,
+            upcoming: contextualTask.reminder_enabled && contextualTask.status === 'open' && contextualTask.deleted_at === null
+              ? reminderSlots(rule, contextualTask.due_date, contextualTask.reminder_anchor ?? contextualTask.created_at, clock(), 4)
+                .map((at) => new Date(at).toISOString()) : [],
+            focus: notificationFocus(history, contextualTask.id, contextualTask.reminder_version) } : undefined,
         })
         if (!event.inbox.canCommit()) return
         if (parsed.kind === 'timeout' || parsed.kind === 'unavailable') {
@@ -171,11 +193,11 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
         if (parsed.kind === 'parsed') {
           const proposal = parsed.action
           action = authorizeIntent(answeredTask && 'target' in proposal
-            ? { ...proposal, target: { by: 'name', name: answeredTask } } : proposal, event.text, !!quote || original !== undefined)
+            ? { ...proposal, target: { by: 'name', name: answeredTask } } : proposal, event.text, !!quote || original !== undefined, event.eventTime)
           if (action) {
             const saved = await db.prepare(`UPDATE webhook_inbox SET action_json = ? WHERE receipt_id = ?
               AND status = 'running' AND lease_token = ? AND lease_until > ?`)
-            .bind(JSON.stringify(action), row.receipt_id, event.inbox.leaseToken, clock()).run()
+            .bind(JSON.stringify({ action, observedTask: event.observedTask }), row.receipt_id, event.inbox.leaseToken, clock()).run()
             if (!saved.meta.changes) return
           }
         }
@@ -193,7 +215,10 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
 
     if (!event.inbox.canCommit()) return
     event.now = clock()
-    if (action) reply = await dispatchAction(db, event, action)
+    if (action) {
+      event.turn = { operation: action.type }
+      reply = await dispatchAction(db, event, action)
+    }
     // Mutating actions already commit the Inbox result with their D1 batch.
     if (event.inbox.canCommit() && !await wasProcessed(db, event.eventId)) {
       await finishInboxEvent(db, { ...event, now: clock() }, !!action && action.type !== 'help', reply, failure)
@@ -203,7 +228,7 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
   }
 }
 
-export function authorizeIntent(action: TaskAction, text: string, contextual = false): TaskAction | undefined {
+export function authorizeIntent(action: TaskAction, text: string, contextual = false, now?: number): TaskAction | undefined {
   if ('target' in action) {
     if (action.target.by === 'id' && !text.normalize('NFKC').match(/#[0-9]+/g)?.includes('#' + action.target.id)) return
     if (action.target.by === 'name') {
@@ -211,24 +236,27 @@ export function authorizeIntent(action: TaskAction, text: string, contextual = f
       if (!namesTarget(text, name)) return
       action = { ...action, target: { ...action.target, name } }
     }
-    if (action.target.by === 'recent' && !contextual && !action.type.includes('reminder') &&
+    if (action.target.by === 'recent' && !contextual && action.type !== 'edit_notifications' && !action.type.includes('reminder') &&
       !/さっき|やっぱ|これ|それ|この|その|前の|今の/.test(text)) return
   }
   const normalized = text.normalize('NFKC')
-  const edit = action.type === 'modify_reminder' || action.type === 'set_reminder'
+  const edit = action.type === 'modify_reminder' || action.type === 'set_reminder' || action.type === 'edit_notifications'
   if (edit && /早め|遅め|もっと早|もっと遅/.test(normalized) && !/\d+(?:時|:\d{2}|日|週間)|前日|当日|朝|夜/.test(normalized)) {
     return { type: 'clarify', question: 'time' }
   }
   const additive = /(?:日前|週間前|前日|当日|時(?:\d+分)?|:\d{2})(?:に)?も(?:\s|[、。！!]|通知|教え|知らせ|追加|欲しい|ほしい|$)/.test(normalized)
   const replacement = action.type === 'modify_reminder' ? action.edit.mode === 'replace' : action.type === 'set_reminder' && action.setting.by === 'rule'
-  const isAddition = action.type === 'modify_reminder' && (action.edit.mode === 'add' || action.edit.mode === 'add_time')
+  const isAddition = action.type === 'modify_reminder' && (action.edit.mode === 'add' || action.edit.mode === 'add_time') ||
+    action.type === 'edit_notifications' && action.edits.some((edit) => edit.op === 'add' || edit.op === 'add_clock') &&
+      (action.edits.every((edit) => edit.op === 'add' || edit.op === 'add_clock') ||
+        /消して|削除|じゃなく|ではなく|いらない|止めて|停止|再開|変更|に変え|を[^、。]+にして/.test(normalized))
   if (additive && !isAddition && (('target' in action && action.type !== 'get_reminder') || action.type === 'set_group_default') &&
     !/\n補足：(?:置き換え|入れ替え)/.test(text)) return { type: 'clarify', question: 'mode' }
   if (replacement && action.type === 'modify_reminder' &&
     !/だけ|のみ|代わり|置き換|入れ替|リセット|全部|これから|今後|にし[てたい]|に変え|に変更|でいい|じゃなく/.test(normalized)) {
     return { type: 'clarify', question: 'mode' }
   }
-  return action
+  return now === undefined ? action : validateNotificationIntent(action, text, now)
 }
 
 async function retryEvent(db: D1Database, row: Claimed, event: InboxEvent, now: number, reason: string, reply?: string) {

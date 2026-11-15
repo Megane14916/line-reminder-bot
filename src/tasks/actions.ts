@@ -5,6 +5,9 @@ import { askClarification } from './clarification'
 import { applyEvent, findTasks, getContext, getTask, listTasks, mentionsOtherTask, pendingContext, saveContext,
   type Task, type TaskEvent } from './repository'
 import { editReminder } from './reminder-edits'
+import { applyNotificationPlan, configuredTimes } from './notification-plan'
+import { notificationFocus } from './conversation'
+import { formatNotificationChanges } from '../line/messages'
 import { changeReminderTime, defaultRule, reminderSlots, ruleSchema } from './schedule'
 import { todayInJapan } from './validation'
 
@@ -92,9 +95,15 @@ const quotationConflict = '💬 引用したタスクと本文のタスク名が
 async function changeTask(db: D1Database, event: TaskEvent, action: TargetAction, task: Task,
   context?: { pending: string } | { recent: number }) {
   let rule = ruleSchema.parse(JSON.parse(task.reminder_rule))
+  const beforeRule = rule
   let anchor = task.reminder_anchor ?? task.created_at
   let { title, category, due_date: dueDate, status, deleted_at: deletedAt, reminder_enabled: enabled } = task
   let heading: string
+  let details = ''
+  const observed = event.observedTask
+  if (action.type === 'edit_notifications' && observed?.id === task.id && observed.version !== task.reminder_version) {
+    return '🔔 通知設定が先に変更されました。現在の設定を確認して、もう一度送ってください。'
+  }
   switch (action.type) {
     case 'get_reminder': {
       const active = Boolean(enabled && status === 'open' && deletedAt === null)
@@ -158,6 +167,41 @@ async function changeTask(db: D1Database, event: TaskEvent, action: TargetAction
           : action.edit.mode === 'add' || action.edit.mode === 'add_time' ? '🔔 通知を追加しました' : '🔔 通知設定を変更しました'
       break
     }
+    case 'edit_notifications': {
+      const configured = await db.prepare('SELECT rule_json FROM group_reminder_defaults WHERE group_id = ?')
+        .bind(event.groupId).first<string>('rule_json')
+      const groupTimes = configured ? configuredTimes(ruleSchema.parse(JSON.parse(configured)), dueDate, event.now) : []
+      const planned = applyNotificationPlan({ rule, anchor, dueDate, enabled: !!enabled, now: event.now,
+        focus: notificationFocus(event.history ?? [], task.id, task.reminder_version),
+        defaultTime: groupTimes.length === 1 ? groupTimes[0] : undefined }, action.edits)
+      if (!planned.ok) {
+        if (planned.reason === 'time' || planned.reason === 'day' || planned.reason === 'missing') {
+          const prompt = planned.reason === 'missing'
+            ? `🔔 ${planned.time ? planned.time + 'の' : '変更する'}通知が見つかりません。\nどの日の通知か教えてください。`
+            : planned.time ? `🔔 ${planned.time}のどの通知を変更しますか？\n通知の日を教えてください。` : undefined
+          return askClarification(db, event, planned.reason === 'time' ? 'time' : 'day', task.id, prompt)
+        }
+        if (planned.reason === 'past') return '🔔 過ぎた日時には通知を設定できません。'
+        if (planned.reason === 'limit') return '🔔 通知設定の上限に達しています。'
+        return askClarification(db, event, 'mode', task.id)
+      }
+      if (!planned.changes.length) {
+        const reply = formatTaskMessage('🔔 その通知はすでに設定されています。', title)
+        if (await applyEvent(db, { ...event, linkTask: true }, reply, saveContext(db, event, action.type, task.id))) return reply
+        return
+      }
+      ;({ rule, anchor } = planned.state)
+      enabled = Number(planned.state.enabled)
+      const [change] = planned.changes
+      heading = planned.changes.length > 1 || change.summary ? '🔔 通知設定を変更しました'
+        : !change.before ? '🔔 通知を追加しました'
+          : change.after ? '🔔 通知時刻を変更しました'
+            : enabled ? '🔔 通知を削除しました' : '🔕 最後の通知を削除し、通知を停止しました'
+      details = formatNotificationChanges(planned.changes, event.now)
+      event.turn = { operation: action.type, taskId: task.id, version: task.reminder_version + 1,
+        before: beforeRule, after: rule, changes: planned.changes }
+      break
+    }
     case 'disable_reminder':
       enabled = 0
       heading = '🔕 通知を停止しました'
@@ -171,14 +215,16 @@ async function changeTask(db: D1Database, event: TaskEvent, action: TargetAction
   const next = active ? reminderSlots(rule, dueDate, anchor, event.now)[0] ?? null : null
   const reminder = { dueDate, rule, anchor, active, next }
   const reply = action.type === 'update_task' ? formatTaskResult(heading, title, category, reminder, event.now)
-    : action.type === 'set_reminder' || action.type === 'modify_reminder' || action.type === 'disable_reminder' || action.type === 'enable_reminder'
-      ? formatReminderSettings(heading, title, reminder, event.now)
+    : action.type === 'set_reminder' || action.type === 'modify_reminder' || action.type === 'edit_notifications' ||
+      action.type === 'disable_reminder' || action.type === 'enable_reminder'
+      ? formatReminderSettings(heading, title, reminder, event.now) + details
       : formatTaskMessage(heading, title)
   const contextGuard = context ? `AND EXISTS (SELECT 1 FROM task_contexts WHERE group_id = ? AND user_id = ?
     AND ${'pending' in context ? 'pending_json' : 'task_id'} = ? AND expires_at > ? AND updated_at <= ?)` : ''
   const contextBindings = context ? [event.groupId, event.userId, 'pending' in context ? context.pending : context.recent, event.now, event.eventTime] : []
   const changes: D1PreparedStatement[] = []
-  if (action.type === 'modify_reminder' && active && ['add', 'add_time', 'remove'].includes(action.edit.mode)) {
+  if (active && (action.type === 'edit_notifications' || action.type === 'update_task' ||
+    action.type === 'modify_reminder' && ['add', 'add_time', 'remove'].includes(action.edit.mode))) {
     // Keep an already-queued, retained slot on its original delivery attempt, body and Retry Key.
     const { results } = await db.prepare(`SELECT scheduled_at FROM reminder_occurrences WHERE group_id = ? AND task_id = ?
       AND rule_version = ? AND status != 'sent' AND scheduled_at >= ?`)

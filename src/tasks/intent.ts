@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import { ruleSchema, timeSchema } from './schedule'
 import { reminderEditSchema } from './reminder-edits'
+import { notificationEditSchema } from './notification-plan'
 
 const category = z.enum(['deadline', 'belonging'])
 const title = z.string().trim().min(1).max(100).regex(/^[^\u0000\r\n]+$/)
@@ -24,6 +25,7 @@ export const intentSchema = z.discriminatedUnion('type', [
   ]) }),
   taskOperation('disable_reminder'), taskOperation('enable_reminder'), taskOperation('get_reminder'),
   taskOperation('modify_reminder').extend({ edit: reminderEditSchema }),
+  taskOperation('edit_notifications').extend({ edits: z.array(notificationEditSchema).min(1).max(8) }),
   z.strictObject({ type: z.literal('set_group_default'), rule: ruleSchema }),
   z.strictObject({ type: z.literal('help') }),
   z.strictObject({ type: z.literal('clarify'), question: z.enum(['task', 'time', 'day', 'mode']).optional() }),
