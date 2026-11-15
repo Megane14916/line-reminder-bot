@@ -19,6 +19,16 @@ LINE グループで家族の提出物や持ち物を管理します。Bot に�
 
 Bot の通知を LINE の引用返信機能で引用し、「終わった」「完了」「✅」などと送ると対象タスクを完了できます。引用元の ID が記録できなかった場合は、Bot にメンションしてタスク名と「完了」を送ってください。
 
+## Webhook の処理と再試行
+
+署名済みの操作を D1 に保存してから LINE に HTTP 200 を返します。保存できなければ503を返します。LINE Developers で Webhook の再送を有効にしてください。保存済みの操作は普段すぐに処理し、Worker が中断しても毎分の Cron が続きを拾います。[LINE の Webhook 再送](https://developers.line.biz/ja/docs/messaging-api/receiving-messages/#webhook-redelivery)
+
+同じグループの保存済み操作は LINE のイベント時刻順に処理します。時刻が同じ場合は D1 の受信順を使います。先に新しい操作が確定すると、遅れて届いた古い操作は終了し、返信できる場合は再操作を案内します。同じグループでは、処理待ちの先頭が再試行中だと後続も待ちます。
+
+AI のタイムアウト・接続障害や D1 の処理エラーは、初回を含め最大3回、受信から最大15分まで再試行します。解釈できない入力や古い操作は再試行しません。状態を調べる場合は `webhook_inbox` の `event_id`、`status`、`attempts`、`last_error` を確認してください。処理完了時は入力と返信トークンを消去します。
+
+LINE への返信はタスク変更とは別に行います。返信は受信から50秒未満で試行するため、Cron で復旧した操作は返信が届かない場合があります。結果が見えない場合は、同じ操作を送り直す前に一覧を確認してください。[LINE の応答トークン](https://developers.line.biz/ja/reference/messaging-api/#send-reply-message)
+
 ## 通知ルール
 
 - 既定では登録時に期限まで8日以上あれば7日前と前日、2〜7日なら前日の20:00に通知します。当日・翌日が期限の場合も、同じ計算から未来の時刻だけが残ります。時刻未指定は20:00、「朝」は08:00、「夜」は20:00です。
@@ -53,5 +63,5 @@ npx.cmd wrangler deploy --dry-run
 ## 設定と本番反映
 
 - `wrangler.jsonc` の `ai.binding` は `AI`、`vars.AI_MODEL` の初期値は `@cf/qwen/qwen3-30b-a3b-fp8` です。日本語と JSON 出力をサポートする Workers AI モデルを指定してください。Workers AI バインディングはアカウントに紐づき、専用の API キーを Worker に置く必要はありません。ローカルで実推論を試す場合は Workers AI を利用できるアカウントで `npx.cmd wrangler login` してください。[モデル仕様](https://developers.cloudflare.com/workers-ai/models/qwen3-30b-a3b-fp8/)
-- 承認後、`wrangler.jsonc` の D1 ID を実際のものに置き換え、`npx.cmd wrangler d1 migrations apply DB --remote` で `0004` を含む未適用分を適用します。既存のタスク・送信履歴は保持されます。新バージョンで旧2本の Cron が無効になり、毎分 Cron が有効になったことを確認します。移行前に旧方式で同日の前日通知が受理されたか不明な場合も、重複防止のため同じ前日20時の枠をスキップします。
+- 承認後、`wrangler.jsonc` の D1 ID を実際のものに置き換え、`npx.cmd wrangler d1 migrations apply DB --remote` で `0005` までの未適用分を適用します。既存のタスク・送信履歴は保持されます。新バージョンで旧2本の Cron が無効になり、毎分 Cron が有効になったことを確認します。移行前に旧方式で同日の前日通知が受理されたか不明な場合も、重複防止のため同じ前日20時の枠をスキップします。
 - LINE Secrets を Git 管理外の `.env.production` に設定して `npx.cmd wrangler deploy --secrets-file .env.production` で手動反映します。テストグループで登録・通知・引用返信を確認後、家族グループで使います。通知の通数は LINE のプラン、推論は Workers AI の利用量に応じます。[LINE の料金](https://developers.line.biz/ja/docs/messaging-api/pricing/) · [Workers AI 料金](https://developers.cloudflare.com/workers-ai/platform/pricing/)
