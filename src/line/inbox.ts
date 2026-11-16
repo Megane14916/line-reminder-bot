@@ -278,7 +278,7 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
             const candidates = await findTasks(db, event.groupId, text.trim(), undefined, proposal.type === 'restore_task')
             if (candidates?.some(({ title }) => title === text.trim())) proposal = { ...proposal, target: { by: 'name', name: text.trim() } }
           }
-          if (pending && !continuing) {
+          if (pending && !continuing && proposal.type !== 'clarify' && proposal.type !== 'unknown') {
             event.thread = newThread
             event.startsThread = true
           }

@@ -1017,6 +1017,16 @@ test('rejects an unrelated destructive model plan during an unfinished registrat
   expect(await platform.env.DB.prepare('SELECT COUNT(*) AS count FROM dialogue_threads WHERE pending_json IS NOT NULL').first('count')).toBe(1)
 })
 
+test('keeps the draft through an unrecognized turn and applies an explicit correction to the due date', async () => {
+  vi.mocked(Date.now).mockReturnValue(deviceNow)
+  await command(physicsRequest, physicsDraft)
+  await command('ごめん、説明がうまくできない', { type: 'unknown' })
+  await command('持っていくのは明後日に変更。通知は今日の21時で', { type: 'continue', fields: { dueDate: '2026-11-18',
+    notice: { kind: 'absolute', date: '2026-11-16', time: '21:00' } } })
+  expect((await taskRows()).results).toMatchObject([{ title: physicsDraft.fields.title, category: 'belonging', due_date: '2026-11-18',
+    next_reminder_at: Date.parse('2026-11-16T21:00:00+09:00') }])
+})
+
 const plan = (...edits: import('../src/tasks/notification-plan').NotificationEdit[]) => ({ type: 'edit_notifications', target: recent, edits })
 const relativeDate = (daysBefore: number, time?: string) => ({ kind: 'relative' as const, daysBefore, time })
 const absoluteDate = (date: string, time: string) => ({ kind: 'absolute' as const, date, time })
