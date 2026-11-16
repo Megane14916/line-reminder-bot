@@ -5,7 +5,7 @@ import { askClarification } from './clarification'
 import { applyEvent, findTasks, getContext, getTask, groupReminderRule, listTasks, mentionsOtherTask, onlyOpenTask, pendingContext, saveContext,
   type Task, type TaskEvent } from './repository'
 import { editReminder } from './reminder-edits'
-import { applyNotificationPlan, matchingReminderTimes } from './notification-plan'
+import { applyNotificationPlan, matchingReminderTimes, scheduledTime } from './notification-plan'
 import { explicitNotificationTimes, notificationActivation, notificationDateQuery, notificationPeriod, refersToQuotedNotification, refersToRecentlyAdded } from './notification-dates'
 import { notificationFocus } from './conversation'
 import { formatNotificationChanges, formatNotificationReason } from '../line/messages'
@@ -205,13 +205,17 @@ async function changeTask(db: D1Database, event: TaskEvent, action: TargetAction
       const quoteChange = event.quotedTurn?.version === task.reminder_version && event.quotedTurn.changes?.length === 1
         ? event.quotedTurn.changes[0] : undefined
       const quoteFocus = event.quoteTaskId === task.id && quoteChange?.after && !quoteChange.summary ? quoteChange : undefined
-      const focus = quoteFocus ?? threadFocus ?? notificationFocus(event.history ?? [], task.id, task.reminder_version)
+      const undoQuotedAddition = event.quotedAt !== undefined && action.edits.some((edit) => edit.op === 'undo_add')
+      const focus = undoQuotedAddition ? quoteFocus
+        : quoteFocus ?? threadFocus ?? notificationFocus(event.history ?? [], task.id, task.reminder_version)
       const referred = refersToQuotedNotification(event.text ?? '')
+      const referredAddition = refersToRecentlyAdded(event.text ?? '')
       const planned = applyNotificationPlan({ rule, anchor, dueDate, enabled: !!enabled, now: event.now,
-        focus: refersToRecentlyAdded(event.text ?? '') && focus?.before ? undefined : focus,
+        focus: referredAddition && focus?.before ? undefined : focus,
+        focusedClock: referred || referredAddition && !focus?.before ? focus?.after : undefined,
         activation,
         quotedAt: referred && !quoteFocus ? event.quotedAt : undefined,
-        clockQuote: event.quotedAt, groupRule,
+        clockQuote: event.quotedAt ?? (quoteFocus?.after ? scheduledTime(quoteFocus.after, dueDate) : undefined), groupRule,
         periodFor: (when) => event.delegatedPeriod ?? notificationPeriod(event.text ?? '', event.eventTime, when) }, action.edits)
       if (!planned.ok) {
         const referenced = action.edits.some((edit) => 'selector' in edit && edit.selector.kind === 'recent')

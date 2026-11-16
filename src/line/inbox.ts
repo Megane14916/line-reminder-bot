@@ -1,6 +1,6 @@
 import { intentSchema, type TaskAction } from '../tasks/intent'
 import { answerSelection, dispatchAction } from '../tasks/actions'
-import { askClarification, delegatesClock, followupQuestions, holdDialogue } from '../tasks/clarification'
+import { askClarification, cancelsDialogue, delegatesClock, followupQuestions, holdDialogue } from '../tasks/clarification'
 import { applyEvent, findTasks, finishInboxEvent, getBotMessage, getContext, getTask, groupReminderRule, mentionedTask, pendingContext, saveContext, sentMessage, wasProcessed,
   type TaskEvent } from '../tasks/repository'
 import { conversationHistory, notificationFocus } from '../tasks/conversation'
@@ -8,7 +8,7 @@ import { getDialogue, type Dialogue } from '../tasks/dialogue'
 import { continuationFields, dateTimeEvidence, groundedTitle, groundTemporalDraft, hasDifferentQuotedSubject, reconcileDraft,
   resolveDraft, validateCreation } from '../tasks/draft'
 import { clockReasonRequest, explicitNotificationDates, explicitNotificationTimes, literalNotificationEdits, notificationDateQuery,
-  notificationPeriod, refersToQuotedNotification, simpleNotificationEdit, undoAdditionRequest, validateNotificationIntent } from '../tasks/notification-dates'
+  notificationPeriod, refersToQuotedNotification, relativeDays, simpleNotificationEdit, undoAdditionRequest, validateNotificationIntent } from '../tasks/notification-dates'
 import { reminderSlots, ruleSchema } from '../tasks/schedule'
 import { cleanTargetReference, namesTarget } from '../tasks/target-matching'
 import { aiTimeout, runtimeBudget, type RuntimeBudget } from '../runtime-budget'
@@ -201,6 +201,18 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
           '🔔 引用した通知から設定が変わっています。最新の通知を確認して、もう一度送ってください。')
         return
       }
+      if (correction && quote?.task_id && event.quotedAt === null && !quotedChange?.after) {
+        const time = explicitNotificationTimes(text)[0]
+        if (!time) {
+          await finishInboxEvent(db, { ...event, now: clock() }, false, '🔔 指定した時刻は無効です。', 'invalid_intent')
+          return
+        }
+        event.interpretedAction = { type: 'edit_notifications', target: { by: 'recent' },
+          edits: [{ op: 'move', selector: { kind: 'recent' }, to: { kind: 'time', time } }] }
+        await askClarification(db, { ...event, now: clock() }, 'day', quote.task_id,
+          '🔔 どの日の通知を変更しますか？ 通知の日を教えてください。')
+        return
+      }
       if (quick && quote?.task_id) {
         action = { ...quick, target: { by: 'id', id: quote.task_id } }
       } else if (row.action_json) {
@@ -255,7 +267,8 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
         }
         const delegated = pending?.question === 'time' && pending.draft && delegatesClock(text)
         if (delegated) event.delegatedPeriod = notificationPeriod(text, event.eventTime)
-        const dialogue = delegated ? { type: 'continue' as const, fields: {} }
+        const dialogue = pending && cancelsDialogue(text) ? { type: 'cancel' as const }
+          : delegated ? { type: 'continue' as const, fields: {} }
           : parsed.kind === 'dialogue' ? parsed.proposal : parsed.kind === 'parsed'
           ? groundTemporalDraft(parsed.action, text, event.eventTime, pending) : undefined
         const registrationTitle = dialogue?.type === 'draft' && dialogue.operation === 'create_task' ? dialogue.fields.title
@@ -286,11 +299,21 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
             return
           }
           if (proposal.type === 'cancel' && pending) {
+            if (!cancelsDialogue(text)) {
+              await repeatQuestion()
+              return
+            }
             event.thread.pending = undefined
             const message = '進行中の依頼を取り消しました。'
             await applyEvent(db, { ...event, now: clock() }, message, saveContext(db, event, 'cancel', stored?.taskId ?? context?.task_id ?? null))
             return
           }
+        }
+        if (resumeDraft?.question === 'time' && !delegated && !explicitNotificationTimes(text).length &&
+          !explicitNotificationDates(text, event.eventTime).length && !relativeDays(text.normalize('NFKC')).length &&
+          !notificationPeriod(text, event.eventTime)) {
+          await repeatQuestion()
+          return
         }
         if (resumeDraft || dialogue?.type === 'draft') {
           const update = dialogue?.type === 'continue' || dialogue?.type === 'draft' && dialogue.operation === resumeDraft?.draft.operation

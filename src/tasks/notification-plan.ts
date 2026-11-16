@@ -39,7 +39,7 @@ export type NotificationChange = { before?: NotificationSlot; after?: Notificati
   reactivate?: boolean; resumed?: true }
 type Problem = 'time' | 'day' | 'missing' | 'past' | 'limit' | 'conflict'
 type State = { rule: ReminderRule; anchor: number; enabled: boolean }
-type Input = State & { dueDate: string; now: number; focus?: NotificationChange; defaultTime?: string;
+type Input = State & { dueDate: string; now: number; focus?: NotificationChange; focusedClock?: NotificationSlot; defaultTime?: string;
   groupRule?: ReminderRule; quotedAt?: number | null; clockQuote?: number | null; periodFor?: (when?: NotificationDate) => Daypart | undefined;
   activation?: 'resume' | 'keep' }
 type Result = { ok: true; state: State; changes: NotificationChange[] } |
@@ -134,7 +134,7 @@ function addSlot(rule: ReminderRule, slot: NotificationSlot, input: Input): Remi
 }
 
 function pickTime(rule: ReminderRule, input: Input, explicit?: string, destination?: NotificationDate, original?: string) {
-  const focused = input.focus?.after
+  const focused = input.focusedClock
   return resolveNotificationClock({ ...input, rule, explicit, original, quotedAt: input.clockQuote ?? input.quotedAt,
     period: input.periodFor?.(destination), focused: focused && occurrences(rule, input, focused).length === 1 ? focused.time : undefined })
 }

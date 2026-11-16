@@ -36,10 +36,10 @@ test('uses the current clock, a verified focus, group defaults or 20:00 when tie
   expect(applyNotificationPlan(state(mixed), [add])).toMatchObject({
     ok: true, changes: [{ after: relative(21, '20:00'), timeSource: 'default' }],
   })
-  expect(applyNotificationPlan({ ...state(mixed), focus: { after: relative(7, '09:00') } }, [add])).toMatchObject({
+  expect(applyNotificationPlan({ ...state(mixed), focusedClock: relative(7, '09:00') }, [add])).toMatchObject({
     ok: true, changes: [{ after: relative(21, '09:00'), timeSource: 'conversation' }],
   })
-  expect(applyNotificationPlan({ ...state(mixed), focus: { after: relative(7, '08:00') } }, [add])).toMatchObject({
+  expect(applyNotificationPlan({ ...state(mixed), focusedClock: relative(7, '08:00') }, [add])).toMatchObject({
     ok: true, changes: [{ after: relative(21, '20:00'), timeSource: 'default' }],
   })
   expect(applyNotificationPlan(state(mixed), [{ op: 'add', when: relative(21, '10:00') }])).toMatchObject({
@@ -56,6 +56,10 @@ test('chooses a majority, resolves ties independent of ordering, and honors time
   const groupRule = offsets([{ daysBefore: 1, time: '18:30' }])
   const clocks = { dueDate, anchor: now, rule, groupRule }
   expect(resolveNotificationClock(clocks)).toEqual({ time: '21:00', timeSource: 'current' })
+  expect(applyNotificationPlan({ ...state(rule), focus: { after: relative(14, '09:00') } },
+    [{ op: 'add', when: { kind: 'relative', daysBefore: 3 } }])).toMatchObject({
+    ok: true, changes: [{ after: relative(3, '21:00'), timeSource: 'current' }],
+  })
   for (const slots of [[{ daysBefore: 7, time: '09:00' }, { daysBefore: 1, time: '21:00' }],
     [{ daysBefore: 1, time: '21:00' }, { daysBefore: 7, time: '09:00' }]]) {
     expect(resolveNotificationClock({ ...clocks, rule: offsets(slots) })).toEqual({ time: '18:30', timeSource: 'group' })

@@ -1118,10 +1118,10 @@ test('rejects an unrelated destructive model plan during an unfinished registrat
   expect(await platform.env.DB.prepare('SELECT COUNT(*) AS count FROM dialogue_threads WHERE pending_json IS NOT NULL').first('count')).toBe(1)
 })
 
-test('keeps the draft through an unrecognized turn and applies an explicit correction to the due date', async () => {
+test('keeps the draft through an ungrounded cancellation and applies an explicit correction to the due date', async () => {
   vi.mocked(Date.now).mockReturnValue(deviceNow)
   await seedLegacyClockDraft(physicsRequest, physicsDraft)
-  await command('ごめん、説明がうまくできない', { type: 'unknown' })
+  await command('ちょっと待って', { type: 'cancel' })
   await command('持っていくのは明後日に変更。通知は今日の21時で', { type: 'continue', fields: { dueDate: '2026-11-18',
     notice: { kind: 'absolute', date: '2026-11-16', time: '21:00' } } })
   expect((await taskRows()).results).toMatchObject([{ title: physicsDraft.fields.title, category: 'belonging', due_date: '2026-11-18',
@@ -1219,6 +1219,21 @@ test('executes the five-turn autofill flow with a single inference per turn', as
   expect(JSON.parse(String((await taskRows()).results[0].reminder_rule))).toEqual({
     type: 'offsets', slots: [{ daysBefore: 1, time: '21:00' }], absoluteSlots: [{ date: '2026-11-20', time: '21:00' }],
   })
+})
+
+test('a settings summary cannot undo or correct a different notification', async () => {
+  await command('英検を登録 12/14', application)
+  const summary = '987654321101010103'
+  line.mockResolvedValueOnce(new Response(JSON.stringify({ sentMessages: [{ id: summary }] })))
+  await command('今の通知設定を確認したい', { type: 'get_reminder', target: recent })
+  await command('3日前にも通知して', plan(addThird))
+  const [before] = (await taskRows()).results
+  infer.mockResolvedValueOnce({ response: { type: 'unknown' } })
+  await webhook([event('今の追加はなしで', { quote: summary })])
+  expect(lastReply()).toContain('該当する通知は見つかりません')
+  await webhook([event('やっぱ9時にして', { quote: summary })])
+  expect(lastReply()).toContain('どの日の通知を変更しますか')
+  expect((await taskRows()).results).toEqual([before])
 })
 
 test('resumes the saved schedule on a plain request only while the task is open', async () => {
@@ -1591,7 +1606,7 @@ test('keeps settings-only edits paused and resumes future reminders without reop
   await webhook([event('まだ通知しないで', { mention: true })])
   expect(lastReply()).toContain('通知：停止中')
   expect((await taskRows()).results[0]).toMatchObject({ reminder_enabled: 0, next_reminder_at: null })
-  expect(await command('やっぱり3日前にも通知して', plan({ op: 'add', when: relativeDate(3) }))).toContain('通知を再開しました。')
+  expect(await command('やっぱり3日前にも通知して', plan({ op: 'add', when: relativeDate(3) }))).toContain('通知を再開しました')
   expect((await taskRows()).results[0]).toMatchObject({ reminder_enabled: 1, next_reminder_at: Date.parse('2026-12-11T20:00:00+09:00') })
   expect(pushes()).toHaveLength(0)
   await command('英検終わった', { type: 'complete_task', target: byName('英検') })

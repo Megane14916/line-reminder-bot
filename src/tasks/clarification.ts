@@ -26,7 +26,7 @@ export async function holdDialogue(db: D1Database, event: TaskEvent, pending: Pe
 // The model decides what the admitted message means using the whole draft.
 export function followupQuestions(text: string, now: number): PendingDialogue['question'][] {
   const answer = text.normalize('NFKC').trim().replace(/[。！!]+$/u, '')
-  if (/^(?:やっぱり?\s*)?(?:(?:今の)?(?:なし|取り消して)|キャンセル)(?:で|でお願い)?$/.test(answer)) return ['time', 'day', 'mode', 'task', 'title']
+  if (cancelsDialogue(answer)) return ['time', 'day', 'mode', 'task', 'title']
   if (delegatesClock(answer)) return ['time']
   const { dates, times, invalidDay, invalidTime } = dateTimeEvidence(answer, now)
   const questions: PendingDialogue['question'][] = []
@@ -45,6 +45,10 @@ export function followupQuestions(text: string, now: number): PendingDialogue['q
     if (/^(?:(?:今の通知に)?追加|置き換え|入れ替え)(?:で|して|でお願い(?:します)?)?$/.test(answer)) questions.push('mode')
   }
   return questions
+}
+
+export function cancelsDialogue(text: string) {
+  return /^(?:やっぱり?\s*)?(?:(?:今の(?:依頼)?(?:は|を)?)?(?:なし|取り消して|キャンセル(?:して)?))(?:で|でお願い)?[。！!]*$/.test(text.trim())
 }
 
 export function delegatesClock(text: string) {
