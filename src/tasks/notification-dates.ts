@@ -20,7 +20,7 @@ function clocks(text: string) {
 }
 
 const numericDate = /(?<!\d)(?:(\d{4})(?:年|[-/]))?(\d{1,2})(?:月|[-/])(\d{1,2})(?!\d)(?:日)?/g
-const spokenDate = /(明後日|あさって|明日|あした|今日|きょう)|(?:(来週|今週|再来週)\s*)([日月火水木金土])曜(?:日)?/g
+const spokenDate = /(明後日|あさって|明日|あした|今日|きょう)|(?:(来週|今週|再来週)\s*(?:の\s*)?)?([日月火水木金土])曜(?:日)?/g
 const relativeDate = /(?:(\d{1,3}|[一二三四五六七八九十百]{1,5})(日|週間)前)|(締切当日|当日|前日)/g
 function relativeDays(text: string) {
   return [...text.matchAll(relativeDate)].map((match) => {
@@ -49,7 +49,7 @@ export function explicitNotificationDates(text: string, now: number) {
   const today = todayInJapan(now)
   const [year, currentMonth] = today.split('-').map(Number)
   const midnight = jstMidnight(today)
-  const clock = clocks(normalized)
+  const clock = clocks(normalized).filter(({ index, end }) => /\d/.test(normalized.slice(index, end)))
   const dates: { date?: string; time?: string; index: number; end: number }[] = []
   for (const match of normalized.matchAll(numericDate)) {
     const month = Number(match[2]), dateOfMonth = Number(match[3])
@@ -60,15 +60,21 @@ export function explicitNotificationDates(text: string, now: number) {
       index: match.index, end: match.index + match[0].length })
   }
   for (const match of normalized.matchAll(spokenDate)) {
-    const offset = match[1] ? /明後日|あさって/.test(match[1]) ? 2 : /明日|あした/.test(match[1]) ? 1 : 0
+    let offset = match[1] ? /明後日|あさって/.test(match[1]) ? 2 : /明日|あした/.test(match[1]) ? 1 : 0
       : (match[2] === '再来週' ? 14 : match[2] === '来週' ? 7 : 0) + (weekdays.indexOf(match[3]) + 6) % 7
         - (new Date(midnight + 9 * 3_600_000).getUTCDay() + 6) % 7
+    if (!match[1] && !match[2] && offset < 0) offset += 7
     dates.push({ date: todayInJapan(midnight + offset * day), index: match.index, end: match.index + match[0].length })
   }
   return dates.sort((a, b) => a.index - b.index).map((date) => ({
     ...date,
     time: clock.find((time) => time.index >= date.end && /^[\sの、]*$/.test(normalized.slice(date.end, time.index)))?.time,
   }))
+}
+
+export function explicitNotificationTimes(text: string) {
+  const normalized = text.normalize('NFKC')
+  return clocks(normalized).filter(({ index, end }) => /\d/.test(normalized.slice(index, end))).map(({ time }) => time)
 }
 
 function preciseDate(text: string, now: number): NotificationDate | undefined {
@@ -248,7 +254,7 @@ function dateOperands(edit: NotificationEdit): NotificationDate[] {
   return result
 }
 
-export function validateNotificationIntent(action: TaskAction, text: string, now: number): TaskAction {
+export function validateNotificationIntent(action: TaskAction, text: string, now: number, correctRecentNotice = false): TaskAction {
   const reminderOperation = action.type === 'edit_notifications' || action.type === 'modify_reminder' ||
     action.type === 'set_reminder' || action.type === 'disable_reminder' || action.type === 'enable_reminder'
   const normalized = text.normalize('NFKC')
@@ -262,7 +268,7 @@ export function validateNotificationIntent(action: TaskAction, text: string, now
   if (/(?:通知設定|通知の設定)(?:を|が|は)?(?:確認したい|確認して|教えて)[。？?！!]*$/.test(normalized.trim()) && 'target' in action) {
     return { type: 'get_reminder', target: action.target }
   }
-  if ('target' in action) {
+  if ('target' in action && !correctRecentNotice) {
     const literal = literalNotificationEdits(normalized, now)
     if (literal?.length === 1 && (literal[0].op === 'set_clock' || literal[0].op === 'move' && literal[0].to.kind === 'time')) {
       return { type: 'edit_notifications', target: action.target, edits: literal }
@@ -278,7 +284,7 @@ export function validateNotificationIntent(action: TaskAction, text: string, now
   const individual = refersToIndividualNotification(changedClauses) || dates.length > 0 || relativeDays(changedClauses).length > 0
   const all = parts.some((part) => allClock.test(part) && !negatedAll.test(part) &&
     !refersToIndividualNotification(part) && clocks(part).length > 0)
-  const wholeClock = !individual && !negatedAll.test(normalized) || all
+  const wholeClock = !correctRecentNotice && (!individual && !negatedAll.test(normalized) || all)
   if (action.type !== 'edit_notifications') {
     if (dates.length) return { type: 'clarify', question: 'day' }
     if (action.type === 'disable_reminder' && !all && (times.length || relativeDays(changedClauses).length)) {

@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { ruleSchema, timeSchema } from './schedule'
+import { offset, ruleSchema, timeSchema } from './schedule'
 import { reminderEditSchema } from './reminder-edits'
 import { notificationEditSchema } from './notification-plan'
 
@@ -35,3 +35,17 @@ export const intentSchema = z.discriminatedUnion('type', [
 export type TaskAction = z.infer<typeof intentSchema>
 export type TargetAction = Extract<TaskAction, { target: unknown }>
 export type Clarification = NonNullable<Extract<TaskAction, { type: 'clarify' }>['question']>
+
+const partialNotice = z.discriminatedUnion('kind', [
+  z.strictObject({ kind: z.literal('absolute'), date: date.optional(), time: timeSchema.optional() }),
+  z.strictObject({ kind: z.literal('relative'), daysBefore: offset.optional(), time: timeSchema.optional() }),
+])
+const draftFields = z.strictObject({ title: title.optional(), dueDate: date.optional(), category: category.optional(),
+  rule: ruleSchema.optional(), notice: partialNotice.optional(), target: target.optional() })
+const draftSchema = z.strictObject({ type: z.literal('draft'), operation: z.enum(['create_task', 'edit_notifications']), fields: draftFields })
+export const dialogueSchema = z.discriminatedUnion('type', [draftSchema,
+  z.strictObject({ type: z.literal('continue'), fields: draftFields }),
+  z.strictObject({ type: z.literal('cancel') }), z.strictObject({ type: z.literal('ignore') }),
+])
+export type DialogueProposal = z.infer<typeof dialogueSchema>
+export type TaskDraft = z.infer<typeof draftSchema>

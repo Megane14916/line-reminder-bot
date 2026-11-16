@@ -269,7 +269,7 @@ export function applyNotificationPlan(input: Input, edits: NotificationEdit[]): 
     if (destination && !picked) return reject('time')
     const after = destination && picked ? { ...destination, time: picked.time } : undefined
     if (after && source && scheduledTime(after, input.dueDate) === source.at) continue
-    if (after?.kind === 'absolute' && absoluteTime(after) <= input.now) return reject('past')
+    if (after && (after.kind === 'absolute' || source !== undefined) && scheduledTime(after, input.dueDate) <= input.now) return reject('past')
     const duplicate = after ? occurrences(rule, current, after).length > 0 : false
     if (!before && duplicate) {
       if (edit.op === 'undo_remove' && input.focus?.reactivate && !enabled && input.activation !== 'keep') {

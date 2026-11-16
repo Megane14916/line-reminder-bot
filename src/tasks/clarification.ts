@@ -1,22 +1,44 @@
 import { formatIntentError } from '../line/messages'
 import type { Clarification } from './intent'
-import { applyEvent, getContext, saveContext, type PendingClarification, type TaskEvent } from './repository'
+import { applyEvent, getContext, saveContext, type TaskEvent } from './repository'
+import type { PendingDialogue } from './dialogue'
+import { dateTimeEvidence } from './draft'
+import { explicitNotificationDates } from './notification-dates'
 
 export async function askClarification(db: D1Database, event: TaskEvent, question: Clarification, taskId?: number, prompt?: string) {
   const reply = prompt ?? formatIntentError(question)
   if (!event.text) return reply
-  const context = await getContext(db, event)
-  const pending: PendingClarification = { kind: 'clarification', question, text: event.text, quoteTaskId: event.quoteTaskId, quotedAt: event.quotedAt }
-  if (await applyEvent(db, { ...event, linkTask: taskId !== undefined, turn: { operation: 'clarify', question: reply } }, reply,
-    saveContext(db, event, 'clarification', taskId ?? context?.task_id ?? null, JSON.stringify(pending)))) return reply
+  const pending: PendingDialogue = { question, prompt: reply, originalAt: event.thread?.pending?.originalAt ?? event.eventTime,
+    quotedAt: event.quotedAt, action: event.interpretedAction, draft: event.thread?.pending?.draft, evidence: event.thread?.pending?.evidence }
+  return holdDialogue(db, event, pending, taskId)
 }
 
-export function isClarificationAnswer(question: Clarification, text: string) {
-  const answer = text.normalize('NFKC').replace(/[\s。！!]+$/gu, '')
-  switch (question) {
-    case 'time': return /^(?:朝|夜|午前|午後)?\d{1,2}(?::\d{2}|時(?:\d{1,2}分|半)?)(?:で|に|でお願い(?:します)?|にして)?$/.test(answer)
-    case 'day': return /^(?:(?:\d{1,3}|[一二三四五六七八九十]+)(?:日|週間)前|前日|当日|明日|(?:\d{4}[-/年])?\d{1,2}[-/月]\d{1,2}日?)(?:で|に|の通知|を消して)?$/.test(answer)
-    case 'mode': return /^(?:(?:今の通知に)?追加|置き換え|入れ替え)(?:で|して|でお願い(?:します)?)?$/.test(answer)
-    case 'task': return answer.length > 0 && answer.length <= 100
+export async function holdDialogue(db: D1Database, event: TaskEvent, pending: PendingDialogue, taskId?: number) {
+  const context = await getContext(db, event)
+  const thread = { ...(event.thread ?? { id: event.eventId, original: event.text ?? '', taskId: null }), pending }
+  thread.taskId = taskId ?? thread.taskId
+  if (await applyEvent(db, { ...event, thread, linkTask: thread.taskId !== null, turn: { operation: 'clarify', question: pending.prompt } },
+    pending.prompt, saveContext(db, event, 'clarification', thread.taskId ?? context?.task_id ?? null))) return pending.prompt
+}
+
+// An unaddressed group message needs a bounded, pending-question-shaped signal before intake.
+// The model decides what the admitted message means using the whole draft.
+export function followupQuestions(text: string, now: number): PendingDialogue['question'][] {
+  const answer = text.normalize('NFKC').trim().replace(/[。！!]+$/u, '')
+  if (/^(?:やっぱり?\s*)?(?:なし|取り消して|キャンセル)(?:で|でお願い)?$/.test(answer)) return ['time', 'day', 'mode', 'task', 'title']
+  const { dates, times, invalidDay, invalidTime } = dateTimeEvidence(answer, now)
+  const questions: PendingDialogue['question'][] = []
+  if (!/[?？]$/.test(answer)) {
+    const phrase = (answer.split(/[、,]|だから|なので/).at(-1) ?? answer).trim().replace(/^(?:やっぱり?|できれば)\s*/, '')
+    const startsWithClock = /^(?:(?:朝|夜|午前|午後)\s*)?\d{1,2}(?:時|:\d{2})/.test(phrase)
+    const datedClock = explicitNotificationDates(phrase, now).some(({ date, time, index }) => date && time && index === 0)
+    if ((startsWithClock || datedClock) && (times.length || invalidTime) &&
+      /(?:時(?:\d+分|半)?|:\d{2})(?:\s*(?:に|で)(?:して|いい|お願い(?:します)?|通知して)?|\s*通知して)?$/.test(phrase)
+      || /^(?:今日|明日|明後日)の(?:朝|昼|夜)(?:に(?:して|通知して)|で)?$/.test(phrase)) questions.push('time')
+    if (dates.length || invalidDay || /(?:日前|週間前|前日|当日)(?:で|に|の通知)?$/.test(answer)) {
+      if (questions.includes('time') || /(?:日|曜|明日|明後日|\d\/\d{1,2}|\d日前|前日|当日)(?:で|に|の通知)?$/.test(answer)) questions.push('day')
+    }
+    if (/^(?:(?:今の通知に)?追加|置き換え|入れ替え)(?:で|して|でお願い(?:します)?)?$/.test(answer)) questions.push('mode')
   }
+  return questions
 }

@@ -11,6 +11,7 @@ import { notificationFocus } from './conversation'
 import { formatNotificationChanges } from '../line/messages'
 import { changeReminderTime, defaultRule, reminderSlots, ruleSchema } from './schedule'
 import { todayInJapan } from './validation'
+import { namesTarget } from './target-matching'
 
 export async function dispatchAction(db: D1Database, event: TaskEvent, action: TaskAction): Promise<string | undefined> {
   switch (action.type) {
@@ -67,8 +68,13 @@ async function targetOperation(db: D1Database, event: TaskEvent, action: TargetA
   let task: Task | null = null
   if (target.by === 'name') {
     const candidates = await findTasks(db, event.groupId, target.name, target.dueDate, deleted)
-    if (quoteId && !candidates?.some(({ id }) => id === quoteId)) return quotationConflict
+    if (quoteId && (!candidates?.some(({ id }) => id === quoteId) ||
+      event.text && await mentionsOtherTask(db, event.groupId, event.text, quoteId, deleted))) return quotationConflict
     if (!candidates?.length) return askClarification(db, event, 'task')
+    if (!quoteId && event.text && !namesTarget(event.text, target.name) && !candidates.some((candidate) => namesTarget(event.text!, candidate.title))) {
+      const contextualId = event.thread?.taskId ?? (await getContext(db, event))?.task_id
+      if (candidates.length !== 1 || candidates[0].id !== contextualId) return askClarification(db, event, 'task')
+    }
     if (quoteId) task = candidates.find(({ id }) => id === quoteId) ?? null
     else if (candidates.length > 1) {
       const options = candidates.slice(0, 5)
@@ -80,7 +86,8 @@ async function targetOperation(db: D1Database, event: TaskEvent, action: TargetA
     } else task = candidates[0]
   } else {
     if (target.by === 'id' && quoteId && quoteId !== target.id) return quotationConflict
-    const id = target.by === 'id' ? target.id : quoteId === undefined ? (await getContext(db, event))?.task_id : quoteId
+    const id = target.by === 'id' ? target.id : quoteId === undefined
+      ? event.thread?.taskId ?? (await getContext(db, event))?.task_id : quoteId
     if (!id && target.by === 'recent') {
       const individual = action.type === 'edit_notifications' && action.edits.find((edit) =>
         edit.op === 'move' && edit.selector.kind === 'recent' && edit.to.kind === 'time')
@@ -94,7 +101,8 @@ async function targetOperation(db: D1Database, event: TaskEvent, action: TargetA
     }
   }
   if (!task || (task.deleted_at !== null) !== deleted) return '該当するタスクが見つかりません。タスク名や期限を教えてください。'
-  return changeTask(db, event, action, task, target.by === 'recent' && quoteId === undefined ? { recent: task.id } : undefined)
+  return changeTask(db, event, action, task, target.by === 'recent' && quoteId === undefined && event.thread?.taskId !== task.id
+    ? { recent: task.id } : undefined)
 }
 
 const quotationConflict = '💬 引用したタスクと本文のタスク名が異なります。\n操作したいタスク名をメンション付きで送ってください。'
@@ -182,7 +190,9 @@ async function changeTask(db: D1Database, event: TaskEvent, action: TargetAction
       const configured = await db.prepare('SELECT rule_json FROM group_reminder_defaults WHERE group_id = ?')
         .bind(event.groupId).first<string>('rule_json')
       const groupTimes = configured ? configuredTimes(ruleSchema.parse(JSON.parse(configured)), dueDate, event.now) : []
-      const focus = notificationFocus(event.history ?? [], task.id, task.reminder_version)
+      const threadFocus = event.thread?.taskId === task.id && event.thread.focus?.version === task.reminder_version
+        ? event.thread.focus : undefined
+      const focus = threadFocus ?? notificationFocus(event.history ?? [], task.id, task.reminder_version)
       const planned = applyNotificationPlan({ rule, anchor, dueDate, enabled: !!enabled, now: event.now,
         focus: refersToRecentlyAdded(event.text ?? '') && focus?.before ? undefined : focus,
         activation,

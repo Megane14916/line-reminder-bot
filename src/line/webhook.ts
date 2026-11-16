@@ -59,15 +59,16 @@ function getOperation(event: unknown): Operation | undefined {
   const self = mentionees.filter((entry) => isRecord(entry) && entry.isSelf === true)
   const text = stripMentions(message.text, self)
   if (text === undefined) return
+  const sourceMessageId = typeof message.id === 'string' && /^\d+$/.test(message.id) ? message.id : undefined
   const selection = /^#([1-9]\d{0,15})$/.exec(text)
   if (selection && Number.isSafeInteger(Number(selection[1]))) {
-    return { ...context, input: { type: 'selection', id: Number(selection[1]) } }
+    return { ...context, input: { type: 'selection', id: Number(selection[1]), sourceMessageId } }
   }
   if (typeof quotedMessageId === 'string' && /^\d+$/.test(quotedMessageId)) {
-    return { ...context, input: { type: 'quote', messageId: quotedMessageId, text: text.slice(0, 2001), mentioned: self.length > 0 } }
+    return { ...context, input: { type: 'quote', messageId: quotedMessageId, text: text.slice(0, 2001), mentioned: self.length > 0, sourceMessageId } }
   }
-  if (self.length) return { ...context, input: { type: 'intent', text: text.slice(0, 2001) } }
-  if (text && text.length <= 100) return { ...context, input: { type: 'followup', text } }
+  if (self.length) return { ...context, input: { type: 'intent', text: text.slice(0, 2001), sourceMessageId } }
+  if (text && text.length <= 100) return { ...context, input: { type: 'followup', text, sourceMessageId } }
 }
 
 function stripMentions(text: string, mentions: unknown[]) {

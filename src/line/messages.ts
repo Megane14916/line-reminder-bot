@@ -116,7 +116,7 @@ export function formatNotificationChanges(changes: NotificationChange[], now: nu
 }
 
 export function formatTaskResult(heading: string, title: string, category: TaskCategory, reminder: TaskReminder, now: number) {
-  return [formatTaskMessage(heading, title), `期限：${formatTaskDate(reminder.dueDate, now)}`,
+  return [formatTaskMessage(heading, title), `${category === 'belonging' ? '必要日' : '期限'}：${formatTaskDate(reminder.dueDate, now)}`,
     `種類：${categories[category]}`, reminderDetails(reminder, now, false)].join('\n')
 }
 

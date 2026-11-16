@@ -49,5 +49,7 @@ export function expireConversation(db: D1Database, now: number) {
       SELECT event_id FROM task_conversation WHERE expires_at <= ? ORDER BY expires_at LIMIT 100)`).bind(now),
     db.prepare(`DELETE FROM task_contexts WHERE rowid IN (
       SELECT rowid FROM task_contexts WHERE expires_at <= ? LIMIT 100)`).bind(now),
+    db.prepare(`DELETE FROM dialogue_threads WHERE id IN (
+      SELECT id FROM dialogue_threads WHERE expires_at <= ? ORDER BY expires_at LIMIT 100)`).bind(now),
   ])
 }
