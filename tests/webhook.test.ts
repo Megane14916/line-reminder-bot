@@ -8,7 +8,8 @@ import { drainResults, failedInference, unknownOperation } from '../src/line/out
 import { runtimeBudget, withinBudget } from '../src/runtime-budget'
 import { runReminders } from '../src/reminders'
 import { testPlatform } from './platform'
-import { deviceCases } from './dialogue-cases'
+import { deviceCases, reviewCases } from './dialogue-cases'
+import { dialogueSchema, intentSchema } from '../src/tasks/intent'
 import { reminderSlots, ruleSchema } from '../src/tasks/schedule'
 
 const secret = 'test-secret'
@@ -928,6 +929,42 @@ describe.runIf(evaluationEnv.RUN_REAL_DIALOGUE_EVAL === '1')('Workers AI dialogu
     expect(sawQuestion).toBe(Boolean(question))
     if (notice) expect(schedule).toContain(Date.parse(notice))
   }, 60_000)
+
+  test.each(reviewCases)('review $name', async ({ name, turns, expected }) => {
+    vi.mocked(Date.now).mockReturnValue(deviceNow)
+    const raw: unknown[] = []
+    let index = 0
+    infer.mockImplementation(async (modelName: typeof model, input: Ai_Cf_Qwen_Qwen3_30B_A3B_Fp8_Input) => {
+      const format = turns[index].format
+      const result = await remote.env.AI.run(modelName, format && 'messages' in input && input.messages ? {
+        ...input, messages: input.messages.map((message, position) => position === 0
+          ? { ...message, content: '2026-11-16 10:00 JST。家族のLINE Botとして保存済みの依頼に回答してください。' +
+            '次の形式のJSONオブジェクトを1つ返してください。' + format + '\n' +
+            '参照データからタスク・日本時間・通知を復元し、指定の形式を使ってください。 /no_think' } : message),
+      } : input)
+      const value = (result as { response?: unknown }).response
+      raw.push(typeof value === 'string' ? JSON.parse(value) : value)
+      return result
+    })
+    const replies: string[] = []
+    for (const turn of turns) {
+      const id = String(987654321250000010n + BigInt(index))
+      const before = line.mock.calls.length
+      line.mockResolvedValueOnce(new Response(JSON.stringify({ sentMessages: [{ id }] })))
+      await webhook([event(turn.text, { mention: turn.mention, quote: turn.quote === undefined ? undefined : replies[turn.quote] })])
+      if (line.mock.calls.length > before) replies[index] = id
+      else line.mockReset().mockImplementation(async () => new Response('{}'))
+      index++
+    }
+    const actual = (await taskRows()).results.map((row) => ({
+      date: row.due_date, notices: reminderSlots(ruleSchema.parse(JSON.parse(String(row.reminder_rule))),
+        String(row.due_date), Number(row.reminder_anchor), deviceNow, 15),
+    }))
+    const accepted = raw.filter((value) => intentSchema.safeParse(value).success || dialogueSchema.safeParse(value).success).length
+    console.info(JSON.stringify({ review: name, raw, accepted, actual, reply: lastReply() }))
+    expect(actual).toEqual(expected.map(({ date, notices }) => ({ date, notices: notices?.map((time) => Date.parse(time)) })))
+    expect(await pendingThread()).toBeNull()
+  }, 60_000)
 })
 
 test.each([
@@ -1030,6 +1067,253 @@ test('keeps the draft through an unrecognized turn and applies an explicit corre
 const plan = (...edits: import('../src/tasks/notification-plan').NotificationEdit[]) => ({ type: 'edit_notifications', target: recent, edits })
 const relativeDate = (daysBefore: number, time?: string) => ({ kind: 'relative' as const, daysBefore, time })
 const absoluteDate = (date: string, time: string) => ({ kind: 'absolute' as const, date, time })
+
+const completedPhysics = { type: 'create_task', title: physicsDraft.fields.title, category: 'belonging', dueDate: '2026-11-17',
+  rule: { type: 'offsets', slots: [], absoluteSlots: [{ date: '2026-11-16', time: '21:00' }] } }
+const removeEve = { op: 'remove' as const, selector: relativeDate(1) }
+const addThird = { op: 'add' as const, when: relativeDate(3) }
+const todayAtNine = Date.parse('2026-11-16T21:00:00+09:00')
+
+function notificationDraft(...edits: import('../src/tasks/intent').DraftEdit[]) {
+  return { type: 'draft', operation: 'edit_notifications', fields: { target: recent, edits } }
+}
+
+function patchEdit(index: number, fields: Omit<import('../src/tasks/intent').DraftEditPatch, 'index'>) {
+  return { type: 'continue', fields: {}, patches: [{ index, ...fields }] }
+}
+
+async function pendingThread() {
+  return platform.env.DB.prepare('SELECT * FROM dialogue_threads WHERE pending_json IS NOT NULL').first()
+}
+
+test.each([
+  ['fields', { type: 'continue', fields: { notice: absoluteDate('2026-11-16', '21:00') } }],
+  ['updated draft', { ...physicsDraft, fields: { ...physicsDraft.fields, notice: absoluteDate('2026-11-16', '21:00') } }],
+  ['completed create', completedPhysics],
+])('reconciles a %s reply with a saved registration', async (_label, output) => {
+  vi.mocked(Date.now).mockReturnValue(deviceNow)
+  const questionId = '987654321100000034'
+  line.mockResolvedValueOnce(new Response(JSON.stringify({ sentMessages: [{ id: questionId }] })))
+  await command(physicsRequest, physicsDraft)
+  infer.mockResolvedValueOnce({ response: output })
+  const answer = event('11/16の21時に通知して', { quote: questionId })
+  await Promise.all([webhook([answer]), webhook([answer])])
+  expect((await taskRows()).results).toMatchObject([{ title: physicsDraft.fields.title, category: 'belonging',
+    due_date: '2026-11-17', next_reminder_at: todayAtNine }])
+  expect(await pendingThread()).toBeNull()
+})
+
+test.each([
+  { ...completedPhysics, title: '無関係なタスク' },
+  { ...completedPhysics, dueDate: '2026-11-18' },
+  { ...completedPhysics, rule: { type: 'offsets', slots: [], absoluteSlots: [{ date: '2026-11-16', time: '25:45' }] } },
+  { ...completedPhysics, rule: { type: 'offsets', slots: [], absoluteSlots: [{ date: '2026-11-16', time: '20:00' }] } },
+  { ...completedPhysics, rule: { type: 'offsets', slots: [{ daysBefore: 1, time: '21:00' }], absoluteSlots: [{ date: '2026-11-16', time: '21:00' }] } },
+  { type: 'delete_task', target: recent },
+])('preserves the question after an incompatible completed intent %#', async (output) => {
+  vi.mocked(Date.now).mockReturnValue(deviceNow)
+  await command(physicsRequest, physicsDraft)
+  const state = await pendingThread()
+  const before = line.mock.calls.length
+  infer.mockResolvedValueOnce({ response: output })
+  await webhook([event('21時')])
+  expect(line.mock.calls).toHaveLength(before + 1)
+  expect(lastReply()).toBe('🔔 今日の何時に通知しますか？')
+  expect((await pendingThread())?.pending_json).toBe(state?.pending_json)
+  expect((await taskRows()).results).toEqual([])
+})
+
+test.each([
+  ['patch', patchEdit(1, { when: relativeDate(3, '21:00') })],
+  ['clock-only patch', patchEdit(1, { time: '21:00' })],
+  ['partial edit array', { type: 'continue', fields: { edits: [{ op: 'add', when: { kind: 'relative', time: '21:00' } }] } }],
+  ['snapshot', notificationDraft(removeEve, { op: 'add', when: relativeDate(3, '21:00') })],
+  ['completed edit', plan(removeEve, { op: 'add', when: relativeDate(3, '21:00') })],
+])('applies an ordered removal and addition once after a %s answer', async (_label, output) => {
+  vi.mocked(Date.now).mockReturnValue(deviceNow)
+  await command('英検を登録', calendarTask)
+  const [before] = (await taskRows()).results
+  expect(await command('前日の通知を消して、3日前の夜に通知して', notificationDraft(removeEve, addThird))).toContain('何時')
+  expect((await taskRows()).results).toEqual([before])
+  expect(JSON.parse(String((await pendingThread())?.pending_json)).draft.fields.edits).toEqual([removeEve, addThird])
+  const answer = event('21時')
+  infer.mockResolvedValueOnce({ response: output })
+  await Promise.all([webhook([answer]), webhook([answer])])
+  const [after] = (await taskRows()).results
+  expect(JSON.parse(String(after.reminder_rule)).slots).toEqual([seventh, { daysBefore: 3, time: '21:00' }])
+  expect(after.reminder_version).toBe(Number(before.reminder_version) + 1)
+  expect(await pendingThread()).toBeNull()
+})
+
+test('keeps the already specified clock when a second addition still needs a clock', async () => {
+  vi.mocked(Date.now).mockReturnValue(deviceNow)
+  await command('英検を登録', calendarTask)
+  const exactThird = { op: 'add' as const, when: relativeDate(3, '21:00') }
+  const today = { op: 'add' as const, when: relativeDate(0) }
+  expect(await command('3日前の21時と、当日の朝にも通知して', notificationDraft(exactThird, today))).toContain('何時')
+  infer.mockResolvedValueOnce({ response: patchEdit(1, { when: relativeDate(0, '07:00') }) })
+  await webhook([event('7時')])
+  expect(JSON.parse(String((await taskRows()).results[0].reminder_rule)).slots).toEqual([
+    seventh, { daysBefore: 3, time: '21:00' }, eve, { daysBefore: 0, time: '07:00' },
+  ])
+})
+
+test('retains the third edit through a clarification, including an already specified move', async () => {
+  vi.mocked(Date.now).mockReturnValue(deviceNow)
+  const remove = { op: 'remove' as const, selector: relativeDate(7) }
+  const move = { op: 'move' as const, selector: relativeDate(1), to: { kind: 'time' as const, time: '19:00' } }
+  await command('英検を登録', calendarTask)
+  expect(await command('7日前を消して、3日前の夜に通知して、前日の通知は19時に変えて', notificationDraft(remove, addThird, move))).toContain('何時')
+  infer.mockResolvedValueOnce({ response: patchEdit(1, { when: relativeDate(3, '21:00') }) })
+  await webhook([event('21時')])
+  expect(JSON.parse(String((await taskRows()).results[0].reminder_rule)).slots).toEqual([
+    { daysBefore: 3, time: '21:00' }, { daysBefore: 1, time: '19:00' },
+  ])
+})
+
+test.each([
+  ['やっぱ7日前は消さないで。3日前は21時で', { type: 'continue', fields: {}, patches: [
+    { index: 0, drop: true }, { index: 1, when: relativeDate(3, '21:00') },
+  ] }, [seventh, { daysBefore: 3, time: '21:00' }, eve]],
+  ['やっぱ4日前に変更して、21時で', patchEdit(1, { when: relativeDate(4, '21:00') }),
+    [{ daysBefore: 4, time: '21:00' }, eve]],
+] as const)('grounds an explicit correction %s in the saved array', async (answer, output, expected) => {
+  vi.mocked(Date.now).mockReturnValue(deviceNow)
+  const remove = { op: 'remove' as const, selector: relativeDate(7) }
+  await command('英検を登録', calendarTask)
+  await command('7日前を消して、3日前の夜に通知して', notificationDraft(remove, addThird))
+  infer.mockResolvedValueOnce({ response: output })
+  await webhook([event(answer)])
+  expect(JSON.parse(String((await taskRows()).results[0].reminder_rule)).slots).toEqual(expected)
+})
+
+test('leaves both edits pending after an invalid answer or a completed plan that drops the removal', async () => {
+  vi.mocked(Date.now).mockReturnValue(deviceNow)
+  await command('英検を登録', calendarTask)
+  const [before] = (await taskRows()).results
+  await command('前日の通知を消して、3日前の夜に通知して', notificationDraft(removeEve, addThird))
+  infer.mockResolvedValueOnce({ response: patchEdit(1, { when: relativeDate(3, '21:00') }) })
+  await webhook([event('25時')])
+  expect(lastReply()).toContain('時刻を確認')
+  infer.mockResolvedValueOnce({ response: plan({ op: 'add', when: relativeDate(3, '21:00') }) })
+  await webhook([event('21時')])
+  expect((await taskRows()).results).toEqual([before])
+  expect(JSON.parse(String((await pendingThread())?.pending_json)).draft.fields.edits).toEqual([removeEve, addThird])
+})
+
+test('detects a concurrent change from the version that was current before the question', async () => {
+  vi.mocked(Date.now).mockReturnValue(deviceNow)
+  await command('英検を登録', calendarTask)
+  await command('前日の通知を消して、3日前の夜に通知して', notificationDraft(removeEve, addThird))
+  await command('英検申し込みの通知を全部19時にして', { ...plan({ op: 'set_clock', time: '19:00' }), target: byName('英検申し込み') },
+    { userId: 'user-b' })
+  const before = (await taskRows()).results
+  infer.mockResolvedValueOnce({ response: patchEdit(1, { when: relativeDate(3, '21:00') }) })
+  await webhook([event('21時')])
+  expect(lastReply()).toContain('先に変更されました')
+  expect((await taskRows()).results).toEqual(before)
+})
+
+test('starts a new quoted registration thread with its own origin, then accepts a further edit on the original quote', async () => {
+  vi.mocked(Date.now).mockReturnValue(deviceNow)
+  const bookId = '987654321100000039'
+  const questionId = '987654321100000040'
+  line.mockResolvedValueOnce(new Response(JSON.stringify({ sentMessages: [{ id: bookId }] })))
+  await command('教科書 11/20', { type: 'create_task', title: '教科書', category: 'belonging', dueDate: '2026-11-20' })
+  const [book] = (await taskRows()).results
+  const text = '明日体操服持っていくから夜に通知して'
+  const clothing = { ...physicsDraft, fields: { ...physicsDraft.fields, title: '体操服を持っていく' } }
+  line.mockResolvedValueOnce(new Response(JSON.stringify({ sentMessages: [{ id: questionId }] })))
+  infer.mockResolvedValueOnce({ response: clothing })
+  const registration = event(text, { quote: bookId })
+  await webhook([registration])
+  expect(lastReply()).toBe('🔔 今日の何時に通知しますか？')
+  expect(await pendingThread()).toMatchObject({ id: registration.webhookEventId, original_text: text, task_id: null })
+  expect((await taskRows()).results).toEqual([book])
+  infer.mockResolvedValueOnce({ response: { type: 'continue', fields: { notice: { kind: 'absolute', time: '21:00' } } } })
+  await webhook([event('21時', { quote: questionId })])
+  const [original, added] = (await taskRows()).results
+  expect(original).toEqual(book)
+  expect(added).toMatchObject({ title: '体操服を持っていく', due_date: '2026-11-17', next_reminder_at: todayAtNine })
+  infer.mockResolvedValueOnce({ response: plan({ op: 'add', when: relativeDate(2, '18:00') }) })
+  await webhook([event('2日前の18時にも通知して', { quote: bookId })])
+  const [edited, clothingAfter] = (await taskRows()).results
+  expect(JSON.parse(String(edited.reminder_rule)).slots).toContainEqual({ daysBefore: 2, time: '18:00' })
+  expect(clothingAfter).toEqual(added)
+}, 20_000)
+
+test('keeps an answered date while asking for the hour on a separate turn', async () => {
+  vi.mocked(Date.now).mockReturnValue(deviceNow)
+  await command('英検を登録', calendarTask)
+  await command('前日の通知を消して、あと別の日にも通知して', notificationDraft(removeEve, { op: 'add' }))
+  infer.mockResolvedValueOnce({ response: patchEdit(1, { when: { kind: 'absolute', date: '2026-11-20' } }) })
+  await webhook([event('11/20')])
+  expect(lastReply()).toContain('何時')
+  expect(JSON.parse(String((await pendingThread())?.pending_json)).draft.fields.edits).toEqual([
+    removeEve, { op: 'add', when: { kind: 'absolute', date: '2026-11-20' } },
+  ])
+  expect((await taskRows()).results[0].reminder_rule).toBe('{"type":"default"}')
+  infer.mockResolvedValueOnce({ response: patchEdit(1, { when: { kind: 'absolute', time: '09:00' } }) })
+  await webhook([event('9時')])
+  const rule = JSON.parse(String((await taskRows()).results[0].reminder_rule))
+  expect(rule.slots).toEqual([seventh])
+  expect(rule.absoluteSlots).toEqual([{ date: '2026-11-20', time: '09:00' }])
+})
+
+test('does not retarget a new request to the quoted task when the model proposes an edit', async () => {
+  vi.mocked(Date.now).mockReturnValue(deviceNow)
+  const bookId = '987654321100000047'
+  line.mockResolvedValueOnce(new Response(JSON.stringify({ sentMessages: [{ id: bookId }] })))
+  await command('教科書 11/20', { type: 'create_task', title: '教科書', category: 'belonging', dueDate: '2026-11-20' })
+  const before = (await taskRows()).results
+  infer.mockResolvedValueOnce({ response: plan({ op: 'add', when: relativeDate(1, '21:00') }) })
+  await webhook([event('明日体操服持っていくから夜に通知して', { quote: bookId })])
+  expect(lastReply()).toContain('新しいタスクの登録ですか')
+  expect((await taskRows()).results).toEqual(before)
+})
+
+test('starts a different draft from a quoted question without carrying over the unanswered edits', async () => {
+  vi.mocked(Date.now).mockReturnValue(deviceNow)
+  const questionId = '987654321100000049'
+  await command('英検を登録', calendarTask)
+  const [original] = (await taskRows()).results
+  line.mockResolvedValueOnce(new Response(JSON.stringify({ sentMessages: [{ id: questionId }] })))
+  await command('前日の通知を消して、3日前の夜に通知して', notificationDraft(removeEve, addThird))
+  const earlier = await pendingThread()
+  const text = '明日体操服持っていくから夜に通知して'
+  infer.mockResolvedValueOnce({ response: { ...physicsDraft, fields: { ...physicsDraft.fields, title: '体操服を持っていく' } } })
+  await webhook([event(text, { quote: questionId })])
+  const active = await pendingThread()
+  expect(active).toMatchObject({ original_text: text, task_id: null })
+  expect(active?.id).not.toBe(earlier?.id)
+  expect(JSON.parse(String(active?.pending_json)).draft.fields.edits).toBeUndefined()
+  infer.mockResolvedValueOnce({ response: { type: 'continue', fields: { notice: { kind: 'absolute', time: '21:00' } } } })
+  await webhook([event('21時')])
+  expect((await taskRows()).results[0]).toEqual(original)
+  expect((await taskRows()).results[1]).toMatchObject({ title: '体操服を持っていく', next_reminder_at: todayAtNine })
+})
+
+test('uses the quoted schedule when a single answer fills the destination date and clock', async () => {
+  vi.mocked(Date.now).mockReturnValue(deviceNow)
+  const sentAt = Date.parse('2026-11-16T11:00:00+09:00')
+  const quoteId = '987654321100000043'
+  const questionId = '987654321100000044'
+  await command('英検を登録', { ...calendarTask, rule: { type: 'offsets', slots: [eve],
+    absoluteSlots: [{ date: '2026-11-16', time: '11:00' }] } })
+  vi.mocked(Date.now).mockReturnValue(sentAt)
+  line.mockResolvedValueOnce(new Response(JSON.stringify({ sentMessages: [{ id: quoteId }] })))
+  await runReminders(webhookEnv(), () => sentAt)
+  line.mockResolvedValueOnce(new Response(JSON.stringify({ sentMessages: [{ id: questionId }] })))
+  infer.mockResolvedValueOnce({ response: notificationDraft({ op: 'move', selector: { kind: 'recent' } }) })
+  await webhook([event('この通知を別の日に変更したい', { quote: quoteId })])
+  expect(lastReply()).toContain('いつ')
+  const destination = absoluteDate('2026-11-20', '09:00')
+  infer.mockResolvedValueOnce({ response: plan({ op: 'move', selector: { kind: 'recent' }, to: destination }) })
+  await webhook([event('11月20日の朝9時', { quote: questionId })])
+  const [changed] = (await taskRows()).results
+  expect(JSON.parse(String(changed.reminder_rule)).absoluteSlots).toEqual([{ date: '2026-11-20', time: '09:00' }])
+  expect(changed.next_reminder_at).toBe(Date.parse('2026-11-20T09:00:00+09:00'))
+}, 15_000)
 
 test('reproduces the device conversation and corrects the calendar date atomically in D1', async () => {
   vi.spyOn(Date, 'now').mockReturnValue(calendarNow)

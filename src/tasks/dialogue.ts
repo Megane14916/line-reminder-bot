@@ -8,6 +8,8 @@ export type PendingDialogue = {
   action?: TaskAction
   quotedAt?: number | null
   originalAt: number
+  editText?: string
+  observedTask?: { id: number; version: number }
   evidence?: { dates: string[]; times: string[] }
 }
 

@@ -3,13 +3,14 @@ import type { Clarification } from './intent'
 import { applyEvent, getContext, saveContext, type TaskEvent } from './repository'
 import type { PendingDialogue } from './dialogue'
 import { dateTimeEvidence } from './draft'
-import { explicitNotificationDates } from './notification-dates'
+import { explicitNotificationDates, relativeDays } from './notification-dates'
 
 export async function askClarification(db: D1Database, event: TaskEvent, question: Clarification, taskId?: number, prompt?: string) {
   const reply = prompt ?? formatIntentError(question)
   if (!event.text) return reply
-  const pending: PendingDialogue = { question, prompt: reply, originalAt: event.thread?.pending?.originalAt ?? event.eventTime,
-    quotedAt: event.quotedAt, action: event.interpretedAction, draft: event.thread?.pending?.draft, evidence: event.thread?.pending?.evidence }
+  const previous = event.pendingPlan ?? event.thread?.pending
+  const pending: PendingDialogue = { ...previous, question, prompt: reply, originalAt: previous?.originalAt ?? event.eventTime,
+    quotedAt: event.quotedAt, action: event.interpretedAction }
   return holdDialogue(db, event, pending, taskId)
 }
 
@@ -29,10 +30,12 @@ export function followupQuestions(text: string, now: number): PendingDialogue['q
   const { dates, times, invalidDay, invalidTime } = dateTimeEvidence(answer, now)
   const questions: PendingDialogue['question'][] = []
   if (!/[?？]$/.test(answer)) {
-    const phrase = (answer.split(/[、,]|だから|なので/).at(-1) ?? answer).trim().replace(/^(?:やっぱり?|できれば)\s*/, '')
+    const phrase = (answer.split(/[、,。]|だから|なので/).at(-1) ?? answer).trim().replace(/^(?:やっぱり?|できれば)\s*/, '')
     const startsWithClock = /^(?:(?:朝|夜|午前|午後)\s*)?\d{1,2}(?:時|:\d{2})/.test(phrase)
-    const datedClock = explicitNotificationDates(phrase, now).some(({ date, time, index }) => date && time && index === 0)
-    if ((startsWithClock || datedClock) && (times.length || invalidTime) &&
+    const datedClock = explicitNotificationDates(phrase, now).some(({ time, index }) => time && index === 0)
+    const relativeClock = relativeDays(phrase).length > 0 &&
+      /^(?:\d+(?:日|週間)前|前日|当日)(?:の|は)?(?:朝|夜|午前|午後)?\d{1,2}(?:時|:\d{2})/.test(phrase)
+    if ((startsWithClock || datedClock || relativeClock) && (times.length || invalidTime) &&
       /(?:時(?:\d+分|半)?|:\d{2})(?:\s*(?:に|で)(?:して|いい|お願い(?:します)?|通知して)?|\s*通知して)?$/.test(phrase)
       || /^(?:今日|明日|明後日)の(?:朝|昼|夜)(?:に(?:して|通知して)|で)?$/.test(phrase)) questions.push('time')
     if (dates.length || invalidDay || /(?:日前|週間前|前日|当日)(?:で|に|の通知)?$/.test(answer)) {

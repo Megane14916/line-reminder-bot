@@ -11,9 +11,11 @@ const instructions = `家族のLINEで使うタスクBotの操作を分類して
 会話のルール:
 - 「体操服 1/2」「英検申し込み 11/17」「教科書 明日 持ってく」「履歴書書く 12/5」は新規登録。登録という語は不要。「期限を変更して」など既存操作の意図があれば update_task。「あれもう終わった」は文脈の対象を complete_task。持参する物は belonging、提出・申込み・期限のある作業は deadline。曖昧なカテゴリは deadline。雑談や仮定は {"type":"ignore"}。
 - 不足がある新規登録は {"type":"draft","operation":"create_task","fields":{"title":"物理の教科書を持っていく","category":"belonging","dueDate":"2026-11-17","notice":{"kind":"absolute","date":"2026-11-16"}}}。必要日と通知日を区別する。「今日の夜」「明日の朝」は時刻がないので notice.time を省く。日付が不足する登録でも分かっている項目だけ出す。既存通知の追加で不足があれば operation は edit_notifications、fields は target と notice。notice は DATE と同じ形で不足項目を省く。rule は notice を使わない場合に限る。
-- 参照データの pending.draft に続く回答や訂正は {"type":"continue","fields":{変更・補完する項目だけ}}。「21時」「夜9時」「今日の21時に通知して」は例えば fields.notice={"kind":"absolute","time":"21:00"}。質問と無関係な家族の発言には ignore。進行中の取り消しは {"type":"cancel"}。新しい別の依頼は通常の新規操作か draft を返し、古い依頼の条件を混ぜない。
+- 参照データの pending.draft に続く回答や訂正は {"type":"continue","fields":{変更・補完する項目だけ}}。「21時」「夜9時」「今日の21時に通知して」は例えば fields.notice={"kind":"absolute","time":"21:00"}。完成済みの操作、または同じ operation の更新済み draft でもよい。質問と無関係な家族の発言には ignore。進行中の取り消しは {"type":"cancel"}。引用があっても、新しい別の依頼は通常の新規操作か新しい draft を返し、引用元や古い依頼の条件を混ぜない。
+- 通知編集の draft は fields.target と順序付き fields.edits にすべての操作を入れる。「前日の通知を消して、3日前の夜に通知して」なら [{"op":"remove","selector":{"kind":"relative","daysBefore":1}},{"op":"add","when":{"kind":"relative","daysBefore":3}}]。朝・夜だけなら時刻欄を省き、他の編集は保持する。「別の日に変えたい」は move の to を省く。「21時」への continue は {"type":"continue","fields":{},"patches":[{"index":1,"when":{"kind":"relative","time":"21:00"}}]}。index は 0 から。明示された取消は {"index":0,"drop":true}、移動先の補完は to を使う。
 - 通知を追加した結果への引用や直前の追加の言い直しで、単に「やっぱ20時」の場合は recent の move。「8時じゃなくて9時にして」などの一般の通知時刻変更は全体。
 - 完成した登録は {"type":"create_task","title":"教科書","category":"belonging","dueDate":"2026-11-20"} のように平坦に出す。operation と fields を含めるのは draft、fields だけを含めるのは continue。draft の type は必ず "draft"。
+- 【引用元と別の新規登録】参照タスクが「教科書」でも、引用本文「明日体操服持っていくから夜に通知して」は、体操服を新規登録する指示。{"type":"draft","operation":"create_task","fields":{"title":"体操服を持っていく","category":"belonging","dueDate":"2026-11-17","notice":{"kind":"absolute","date":"2026-11-16"}}}（日本時間が2026-11-16の場合）。引用元の教科書の通知設定は編集しない。
 操作とフィールド:
 create_task: title, dueDate, category, 任意のrule。「12/14までに英検申し込み」のような新しい期限付きタスクは登録。登録と同時の通知はruleに含める。
 list_tasks: 任意のcategory, from, to（両端含む）, status（open/done/deleted、既定open）。
@@ -127,13 +129,13 @@ export async function parseIntent(ai: Ai, model: string, text: string, now: numb
     const payload = envelope?.response ?? readObject(choice?.message)?.content
     const value = typeof payload === 'string' ? JSON.parse(payload) : payload
     const record = readObject(value)
-    const wrapped = record && Object.keys(record).every((key) => ['type', 'operation', 'fields'].includes(key)) && readObject(record.fields)
+    const wrapped = record && Object.keys(record).every((key) => ['type', 'operation', 'fields', 'patches'].includes(key)) && readObject(record.fields)
       ? record : undefined
     const normalized = wrapped && (wrapped.type === 'create_task' || wrapped.type === 'edit_notifications') &&
       (wrapped.operation === undefined || wrapped.operation === wrapped.type)
       ? { type: 'draft', operation: wrapped.type, fields: wrapped.fields }
       : wrapped?.type === 'continue' && wrapped.operation === context?.pending?.draft?.operation
-        ? { type: 'continue', fields: wrapped.fields }
+        ? { type: 'continue', fields: wrapped.fields, patches: wrapped.patches }
         : wrapped?.type === 'update_task' && (wrapped.operation === undefined || wrapped.operation === 'update_task')
           ? { ...(context?.task ? { target: { by: 'recent' } } : {}), ...readObject(wrapped.fields), type: 'update_task' } : value
     const result = intentSchema.safeParse(normalized)
@@ -144,6 +146,11 @@ export async function parseIntent(ai: Ai, model: string, text: string, now: numb
     if (partial?.type === 'create_task') {
       const { type: _, ...fields } = partial
       const draft = dialogueSchema.safeParse({ type: 'draft', operation: 'create_task', fields })
+      if (draft.success) return { kind: 'dialogue', proposal: draft.data }
+    }
+    if (partial?.type === 'edit_notifications') {
+      const { type: _, ...fields } = partial
+      const draft = dialogueSchema.safeParse({ type: 'draft', operation: 'edit_notifications', fields })
       if (draft.success) return { kind: 'dialogue', proposal: draft.data }
     }
     return { kind: 'invalid' }

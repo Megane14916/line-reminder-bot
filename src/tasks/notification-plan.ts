@@ -8,7 +8,8 @@ const relative = z.strictObject({ kind: z.literal('relative'), daysBefore: offse
 const absolute = z.strictObject({ kind: z.literal('absolute'), date: z.iso.date(), time: timeSchema.optional() })
 const clock = z.strictObject({ kind: z.literal('time'), time: timeSchema })
 const dateSpec = z.discriminatedUnion('kind', [relative, absolute])
-const selector = z.discriminatedUnion('kind', [relative, absolute, clock, z.strictObject({ kind: z.literal('recent'), time: timeSchema.optional() })])
+export const notificationSelectorSchema = z.discriminatedUnion('kind', [relative, absolute, clock, z.strictObject({ kind: z.literal('recent'), time: timeSchema.optional() })])
+const selector = notificationSelectorSchema
 const recurrence = z.strictObject({ startDaysBefore: offset.nullable(), endDaysBefore: offset, everyDays: z.number().int().min(1).max(366),
   weekdays: z.array(z.number().int().min(0).max(6)).max(7), time: timeSchema.optional() })
 export const notificationEditSchema = z.discriminatedUnion('op', [

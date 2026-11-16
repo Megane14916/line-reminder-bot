@@ -1,7 +1,7 @@
 import { z } from 'zod'
 import { offset, ruleSchema, timeSchema } from './schedule'
 import { reminderEditSchema } from './reminder-edits'
-import { notificationEditSchema } from './notification-plan'
+import { notificationEditSchema, notificationSelectorSchema } from './notification-plan'
 
 const category = z.enum(['deadline', 'belonging'])
 const title = z.string().trim().min(1).max(100).regex(/^[^\u0000\r\n]+$/)
@@ -40,12 +40,26 @@ const partialNotice = z.discriminatedUnion('kind', [
   z.strictObject({ kind: z.literal('absolute'), date: date.optional(), time: timeSchema.optional() }),
   z.strictObject({ kind: z.literal('relative'), daysBefore: offset.optional(), time: timeSchema.optional() }),
 ])
+const partialDestination = z.union([partialNotice, z.strictObject({ kind: z.literal('time'), time: timeSchema.optional() })])
+export const draftEditSchema = z.union([
+  notificationEditSchema,
+  z.strictObject({ op: z.literal('add'), when: partialNotice.optional() }),
+  z.strictObject({ op: z.literal('move'), selector: notificationSelectorSchema, to: partialDestination.optional() }),
+  z.strictObject({ op: z.literal('set_clock'), time: timeSchema.optional(),
+    except: z.array(partialNotice).min(1).max(8).optional() }),
+  z.strictObject({ op: z.literal('add_clock'), time: timeSchema.optional() }),
+])
+const editPatch = z.strictObject({ index: z.number().int().min(0).max(7), when: partialNotice.optional(),
+  to: partialDestination.optional(), time: timeSchema.optional(), drop: z.literal(true).optional() })
 const draftFields = z.strictObject({ title: title.optional(), dueDate: date.optional(), category: category.optional(),
-  rule: ruleSchema.optional(), notice: partialNotice.optional(), target: target.optional() })
+  rule: ruleSchema.optional(), notice: partialNotice.optional(), target: target.optional(),
+  edits: z.array(draftEditSchema).min(1).max(8).optional() })
 const draftSchema = z.strictObject({ type: z.literal('draft'), operation: z.enum(['create_task', 'edit_notifications']), fields: draftFields })
 export const dialogueSchema = z.discriminatedUnion('type', [draftSchema,
-  z.strictObject({ type: z.literal('continue'), fields: draftFields }),
+  z.strictObject({ type: z.literal('continue'), fields: draftFields, patches: z.array(editPatch).min(1).max(8).optional() }),
   z.strictObject({ type: z.literal('cancel') }), z.strictObject({ type: z.literal('ignore') }),
 ])
 export type DialogueProposal = z.infer<typeof dialogueSchema>
 export type TaskDraft = z.infer<typeof draftSchema>
+export type DraftEdit = z.infer<typeof draftEditSchema>
+export type DraftEditPatch = z.infer<typeof editPatch>

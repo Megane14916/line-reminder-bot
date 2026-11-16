@@ -2,7 +2,7 @@ import type { Clarification, TaskAction } from './intent'
 import { saveOperationResult, type OperationResult } from '../line/outbox'
 import { namesTarget, taskKey } from './target-matching'
 import { storeConversation, trimConversation, type ConversationEntry, type Turn } from './conversation'
-import { saveDialogue, supersedeDialogues, type Dialogue } from './dialogue'
+import { saveDialogue, supersedeDialogues, type Dialogue, type PendingDialogue } from './dialogue'
 
 export type TaskCategory = 'deadline' | 'belonging'
 export type Task = {
@@ -15,6 +15,7 @@ export type TaskEvent = {
   messageId?: string
   thread?: Dialogue
   startsThread?: boolean
+  pendingPlan?: PendingDialogue
   interpretedAction?: TaskAction
   quoteTaskId?: number | null
   quotedAt?: number | null

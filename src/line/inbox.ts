@@ -5,7 +5,9 @@ import { applyEvent, findTasks, finishInboxEvent, getBotMessage, getContext, get
   type TaskEvent } from '../tasks/repository'
 import { conversationHistory, notificationFocus } from '../tasks/conversation'
 import { getDialogue, type Dialogue } from '../tasks/dialogue'
-import { groundTemporalDraft, mergeDraft, resolveDraft, validateCreation } from '../tasks/draft'
+import { continuationFields, dateTimeEvidence, groundedTitle, groundTemporalDraft, hasDifferentQuotedSubject, reconcileDraft,
+  resolveDraft, validateCreation } from '../tasks/draft'
+import { withoutVagueClock } from '../tasks/draft-edits'
 import { explicitNotificationDates, explicitNotificationTimes, literalNotificationEdits, notificationDateQuery, validateNotificationIntent } from '../tasks/notification-dates'
 import { reminderSlots, ruleSchema } from '../tasks/schedule'
 import { cleanTargetReference, namesTarget } from '../tasks/target-matching'
@@ -164,6 +166,13 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
       const newThread: Dialogue = { id: event.eventId, original: legacy?.text ?? text, taskId: quote ? quote.task_id : null }
       event.thread = stored ?? newThread
       event.startsThread = !stored
+      const startRegistrationThread = () => {
+        event.thread = { id: event.eventId, original: text, taskId: null }
+        event.startsThread = true
+        event.quoteTaskId = undefined
+        event.quotedAt = undefined
+        event.observedTask = undefined
+      }
       event.text = text
       event.quoteTaskId = quote?.task_id ?? legacy?.quoteTaskId
       if (quote && quote.task_id === null && !stored?.taskId) event.quoteTaskId = null
@@ -174,6 +183,7 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
       event.history = history
       const contextualTask = named ?? (contextualId ? await getTask(db, event.groupId, contextualId) : null)
       if (contextualTask) event.observedTask = { id: contextualTask.id, version: contextualTask.reminder_version }
+      const dialogueVersion = pending?.observedTask
       const quick = quote?.task_id && !pending ? quickQuotedIntent(text) : undefined
       const focus = contextualTask && (stored?.taskId === contextualTask.id && stored.focus?.version === contextualTask.reminder_version
         ? stored.focus : notificationFocus(history, contextualTask.id, contextualTask.reminder_version))
@@ -188,6 +198,11 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
           event.thread = saved.thread ?? event.thread
           event.startsThread = saved.startsThread ?? event.startsThread
           event.text = saved.text ?? event.text
+          if (saved.reference) {
+            event.quoteTaskId = saved.reference.taskId
+            event.quotedAt = saved.reference.at
+          }
+          event.pendingPlan = saved.pendingPlan
         }
         action = intentSchema.parse(saved.action ?? saved)
       } else if (!pending && notificationDateQuery(text, event.eventTime, false)) {
@@ -215,10 +230,31 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
         }
         const dialogue = parsed.kind === 'dialogue' ? parsed.proposal : parsed.kind === 'parsed'
           ? groundTemporalDraft(parsed.action, text, event.eventTime, pending) : undefined
+        const registrationTitle = dialogue?.type === 'draft' && dialogue.operation === 'create_task' ? dialogue.fields.title
+          : parsed.kind === 'parsed' && parsed.action.type === 'create_task' ? parsed.action.title : undefined
+        const newRegistration = registrationTitle && (registrationTitle !== pending?.draft?.fields.title) &&
+          input.type !== 'followup' && groundedTitle(text, registrationTitle) &&
+          !(pending?.draft?.operation === 'create_task' && /(?:名前|名称|タイトル)(?:を|は)/.test(text))
+        const resumeDraft = pending?.draft && !newRegistration ? { ...pending, draft: pending.draft } : undefined
+        if (!registrationTitle && contextualTask && quote?.task_id === contextualTask.id &&
+          hasDifferentQuotedSubject(text, contextualTask.title, event.eventTime) &&
+          (dialogue?.type === 'draft' || parsed.kind === 'parsed' && 'target' in parsed.action)) {
+          await finishInboxEvent(db, { ...event, thread: undefined, now: clock() }, false, '💬 新しいタスクの登録ですか？ 引用したタスクの変更ですか？')
+          return
+        }
+        const repeatQuestion = async () => {
+          event.now = clock()
+          const validity = dateTimeEvidence(text, event.eventTime)
+          const prompt = validity.invalidTime ? '🔔 時刻を確認して、もう一度教えてください。'
+            : validity.invalidDay ? '📅 日付を確認して、もう一度教えてください。' : pending?.prompt
+          if (pending) await holdDialogue(db, event, { ...pending, prompt: prompt ?? pending.prompt })
+          else await finishInboxEvent(db, event, false, formatIntentError(), 'invalid_intent')
+        }
         if (dialogue) {
           const proposal = dialogue
           if (proposal.type === 'ignore') {
-            await finishInboxEvent(db, { ...event, now: clock() }, false)
+            if (resumeDraft && (input.type === 'followup' || quote?.thread_question)) await repeatQuestion()
+            else await finishInboxEvent(db, { ...event, now: clock() }, false)
             return
           }
           if (proposal.type === 'cancel' && pending) {
@@ -227,49 +263,68 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
             await applyEvent(db, { ...event, now: clock() }, message, saveContext(db, event, 'cancel', stored?.taskId ?? context?.task_id ?? null))
             return
           }
-          if (proposal.type === 'draft' || proposal.type === 'continue' && pending?.draft) {
-            if (proposal.type === 'draft' && pending) {
-              if (input.type === 'followup' || quote?.thread_question) {
-                await finishInboxEvent(db, { ...event, now: clock() }, false)
-                return
-              }
-              event.thread = newThread
-              event.startsThread = true
-            }
-            const previous = proposal.type === 'continue' ? pending : undefined
-            const draft = proposal.type === 'draft' ? proposal : mergeDraft(pending!.draft!, proposal.fields, text, event.eventTime)
-            const draftResult = resolveDraft(draft, previous ? original ?? text : text, previous?.originalAt ?? event.eventTime,
-              text, event.eventTime, previous)
-            if ('pending' in draftResult) {
-              event.now = clock()
-              const taskId = draft.operation === 'edit_notifications' ? contextualTask?.id : undefined
-              if (draft.operation === 'create_task') event.thread.taskId = null
-              await holdDialogue(db, event, { ...draftResult.pending, quotedAt: event.quotedAt }, taskId)
-              return
-            }
-            if (draftResult.action.type === 'create_task') action = draftResult.action
-            else {
-              if (previous && original) event.text = original + '\n補足：' + text
-              action = authorizeIntent(draftResult.action, event.text, !!contextualTask, event.eventTime)
-            }
+        }
+        if (resumeDraft || dialogue?.type === 'draft') {
+          const update = dialogue?.type === 'continue' || dialogue?.type === 'draft' && dialogue.operation === resumeDraft?.draft.operation
+            ? dialogue : !dialogue && parsed.kind === 'parsed' && resumeDraft ? continuationFields(parsed.action, resumeDraft.draft) : undefined
+          let resumed = resumeDraft && update ? reconcileDraft(resumeDraft, update, original ?? text, text, event.eventTime) : undefined
+          if (!resumed && resumeDraft?.draft.operation === 'edit_notifications' &&
+            (parsed.kind === 'invalid' || parsed.kind === 'parsed' && parsed.action.type === 'edit_notifications')) {
+            resumed = reconcileDraft(resumeDraft, { fields: {} }, original ?? text, text, event.eventTime, true)
           }
-        } else if (parsed.kind === 'parsed') {
-          let proposal = parsed.action
-          if (pending?.draft && (input.type === 'followup' || quote?.thread_question)) {
-            // A bare reply can finish the known draft only through a validated patch.
-            if (proposal.type === 'clarify' || proposal.type === 'unknown') {
-              event.now = clock()
-              await holdDialogue(db, event, pending)
-            } else await finishInboxEvent(db, { ...event, now: clock() }, false)
+          if (resumeDraft && !resumed || !resumeDraft && dialogue?.type !== 'draft') {
+            await repeatQuestion()
             return
           }
+          const draft = resumed?.draft ?? (dialogue?.type === 'draft' ? dialogue : undefined)
+          if (!draft) {
+            await repeatQuestion()
+            return
+          }
+          if (!resumed && draft.operation === 'create_task') startRegistrationThread()
+          const target = draft.fields.target
+          if (!resumed && draft.operation === 'edit_notifications' && target?.by === 'name' && namesTarget(text, target.name)) {
+            const matches = await findTasks(db, event.groupId, target.name, target.dueDate, false)
+            const namedTask = matches?.length === 1 ? matches[0] : undefined
+            if (namedTask && (!quote?.task_id || quote.task_id === namedTask.id)) {
+              event.thread.taskId = namedTask.id
+              event.observedTask = { id: namedTask.id, version: namedTask.reminder_version }
+            }
+          }
+          if (resumed?.pending.observedTask) event.observedTask = resumed.pending.observedTask
+          const draftOrigin = resumed ? original ?? text : text
+          const originalAt = resumed?.pending.originalAt ?? event.eventTime
+          const draftResult = resolveDraft(draft, draftOrigin, originalAt, text, event.eventTime, resumed?.pending)
+          if ('pending' in draftResult) {
+            event.now = clock()
+            const taskId = draft.operation === 'edit_notifications' ? event.thread.taskId ?? contextualTask?.id : undefined
+            await holdDialogue(db, event, { ...draftResult.pending, quotedAt: event.quotedAt,
+              observedTask: draft.operation === 'edit_notifications' ? event.observedTask : undefined }, taskId)
+            return
+          }
+          if (draftResult.action.type === 'create_task') action = draftResult.action
+          else {
+            const expected = draftResult.action
+            event.text = withoutVagueClock(resumed?.pending.editText ?? draftOrigin)
+            action = authorizeIntent(expected, event.text, !!contextualTask, event.eventTime)
+            if (action?.type !== 'edit_notifications' || expected.type !== 'edit_notifications' ||
+              action.edits.length !== expected.edits.length ||
+              action.edits.some((edit, index) => edit.op !== expected.edits[index].op)) {
+              await repeatQuestion()
+              return
+            }
+            event.pendingPlan = { ...(resumed?.pending ?? { question: 'day', prompt: '🔔 どの通知を変更しますか？', originalAt }),
+              draft, quotedAt: event.quotedAt, observedTask: event.observedTask }
+          }
+        } else if (!dialogue && parsed.kind === 'parsed') {
+          let proposal = parsed.action
           if ((input.type === 'followup' || quote?.thread_question) && pending && proposal.type !== 'clarify' && proposal.type !== 'unknown') {
             const reminder = (operation: string) => ['edit_notifications', 'modify_reminder', 'set_reminder'].includes(operation)
             const previous = pending.action?.type
             const matches = previous ? proposal.type === previous || reminder(proposal.type) && reminder(previous)
               : pending.question === 'task' ? 'target' in proposal : reminder(proposal.type)
             if (!matches) {
-              await finishInboxEvent(db, { ...event, now: clock() }, false)
+              await repeatQuestion()
               return
             }
           }
@@ -282,6 +337,7 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
             event.thread = newThread
             event.startsThread = true
           }
+          if (proposal.type === 'create_task' && (!pending || newRegistration)) startRegistrationThread()
           if (continuing && original) event.text = original + '\n補足：' + text
           if (proposal.type !== 'clarify' && proposal.type !== 'unknown') event.interpretedAction = proposal
           action = authorizeIntent(proposal, event.text, !!contextualTask || !!quote || continuing, event.eventTime, correctRecentNotice)
@@ -296,10 +352,12 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
           if (edits) action = { type: 'edit_notifications', target, edits }
         }
         if (action) {
+          if (action.type === 'edit_notifications' && dialogueVersion && !event.startsThread) event.observedTask = dialogueVersion
           if (action.type !== 'clarify' && action.type !== 'unknown') event.thread.pending = undefined
           const saved = await db.prepare(`UPDATE webhook_inbox SET action_json = ? WHERE receipt_id = ?
               AND status = 'running' AND lease_token = ? AND lease_until > ?`)
-            .bind(JSON.stringify({ action, observedTask: event.observedTask, thread: event.thread, startsThread: event.startsThread, text: event.text }),
+            .bind(JSON.stringify({ action, observedTask: event.observedTask, thread: event.thread, startsThread: event.startsThread,
+              text: event.text, pendingPlan: event.pendingPlan, reference: { taskId: event.quoteTaskId, at: event.quotedAt } }),
               row.receipt_id, event.inbox.leaseToken, clock()).run()
           if (!saved.meta.changes) return
         }

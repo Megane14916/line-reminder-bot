@@ -22,7 +22,7 @@ function clocks(text: string) {
 const numericDate = /(?<!\d)(?:(\d{4})(?:年|[-/]))?(\d{1,2})(?:月|[-/])(\d{1,2})(?!\d)(?:日)?/g
 const spokenDate = /(明後日|あさって|明日|あした|今日|きょう)|(?:(来週|今週|再来週)\s*(?:の\s*)?)?([日月火水木金土])曜(?:日)?/g
 const relativeDate = /(?:(\d{1,3}|[一二三四五六七八九十百]{1,5})(日|週間)前)|(締切当日|当日|前日)/g
-function relativeDays(text: string) {
+export function relativeDays(text: string) {
   return [...text.matchAll(relativeDate)].map((match) => {
     if (match[3]) return Number(match[3] === '前日')
     let amount = Number(match[1])
