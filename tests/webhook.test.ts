@@ -358,6 +358,19 @@ test('stops retrying exhausted inference and scrubs the input and expired reply 
   expect((await taskRows()).results).toEqual([])
 })
 
+test('keeps asking for the title if the model fills it from a reply that did not name the task', async () => {
+  vi.mocked(Date.now).mockReturnValue(deviceNow)
+  const questionId = '987654321100000051'
+  line.mockResolvedValueOnce(new Response(JSON.stringify({ sentMessages: [{ id: questionId }] })))
+  await command('明日までのタスクを登録したい', { type: 'draft', operation: 'create_task',
+    fields: { category: 'deadline', dueDate: '2026-11-17' } })
+  expect(lastReply()).toContain('何のタスク')
+  infer.mockResolvedValueOnce({ response: { type: 'create_task', title: '根拠のないタスク', category: 'deadline', dueDate: '2026-11-17' } })
+  await webhook([event('21時', { quote: questionId })])
+  expect(lastReply()).toContain('何のタスク')
+  expect((await taskRows()).results).toEqual([])
+})
+
 test('uses Push for an expired reply token and does not send again on redelivery', async () => {
   const request = await queueCreate()
   infer.mockResolvedValue({ response: create })

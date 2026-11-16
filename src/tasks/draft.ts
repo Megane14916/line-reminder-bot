@@ -82,7 +82,7 @@ export function reconcileDraft(pending: PendingDialogue & { draft: TaskDraft }, 
       pending: { ...pending, editText: result.editText } }
   }
   if (patch.target || patch.edits || update.patches || patch.rule && JSON.stringify(patch.rule) !== JSON.stringify(old.rule)) return
-  if (patch.title && old.title && patch.title !== old.title && !groundedTitle(text, patch.title)) return
+  if (patch.title && patch.title !== old.title && !groundedTitle(text, patch.title)) return
   if (patch.category && old.category && patch.category !== old.category && !/持ち物|提出物|提出・期限/.test(text)) return
   if (patch.dueDate && patch.dueDate !== old.dueDate && !evidence.dates.includes(patch.dueDate)) return
   if (patch.notice?.time && patch.notice.time !== old.notice?.time && !evidence.times.includes(patch.notice.time)) return
