@@ -5,6 +5,7 @@ LINE グループで家族の提出物や持ち物を管理します。Bot に�
 | 操作 | 送信例 |
 | --- | --- |
 | 登録 | 12月20日までにレポート提出 |
+| 短文で登録 | 教科書 11/20 ／ 履歴書書く 12/5 |
 | 通知付き登録 | 12月20日締切のレポートを登録して。1週間前から毎日20時に通知して |
 | 一覧 | 来週締切の提出物を教えて |
 | 変更 | レポートの名前を作文にして、期限を12月23日に変更して |
@@ -18,7 +19,7 @@ LINE グループで家族の提出物や持ち物を管理します。Bot に�
 | 通知の停止・再開・確認 | このタスクの通知を止めて ／ 通知を再開して ／ いつ通知される？ |
 | 今後のグループ既定値 | 今後登録するタスクはすべて前日21時に通知して |
 
-メンションだけ、または Bot に「使い方」「ヘルプ」と送ると使い方が表示されます。「さっきのやつ」や「やっぱり」は、同じグループ・送信者の直近45分、最大5往復の操作を参照します。候補の番号や通知時刻を聞かれたら、同じ送信者が10分以内に答えてください。過去のタスクは復元しても過ぎた通知は送りません。
+メンションだけ、または Bot に「使い方」「ヘルプ」と送ると使い方が表示されます。「明日教科書を持っていくから、今日の夜通知して」と送り、時刻を聞かれたら「21時」など、聞かれた項目だけ答えます。質問への引用返信でも続けられます。回答待ちの依頼は最後の質問から10分間保持します。「やっぱなし」で取消できます。確定した返信への引用は、最後のやり取りから45分間、同じスレッドのタスクや通知を参照できます。「さっきのやつ」は同じ送信者の最近の操作も参照します。
 
 Bot の登録結果・通知設定・リマインダーなどを LINE で引用すると、メンションなしで操作できます。たとえば登録結果に「2週間前にも」、リマインダーに「もう終わった」と返信します。一覧への返信ではタスク名を添えてください。LINE が引用元の ID を返さなかった場合や、ID の記録前に送った場合は、Bot をメンションして操作してください。
 
@@ -74,16 +75,16 @@ npx.cmd wrangler deploy --dry-run
 
 テストはモック AI・LINE API とローカル D1 を使います。ローカル Worker で実際にメンション操作をすると Workers AI のリモート推論が必要です。
 
-合成した日本語79件で操作・対象・最終通知状態を評価する場合は、Workers AI を利用できるアカウントで Wrangler にログインしてから実行します。通常の評価は、本番と同じく厳密に解釈できる短い指定を TypeScript で処理し、残りをモデルに渡します。全件を実モデルに送る評価は `MODEL_ONLY_INTENT_EVAL=1` を併用します。REST 経由で評価する場合は `CLOUDFLARE_ACCOUNT_ID` と Workers AI を実行できる `CLOUDFLARE_API_TOKEN` を環境変数に設定します。
+Workers AI を利用できるアカウントで Wrangler にログインすると、合成した34シナリオで単発登録と複数ターンの会話を検証できます。ローカル D1 と LINE API のモックを使用します。評価時だけ合成入力に対するモデルの生出力、D1 に反映された予定、推論と操作の所要時間が表示されます。既存の79ケースのIntent評価で全件を実モデルに送る場合は `MODEL_ONLY_INTENT_EVAL=1` を併用します。
 
 ```powershell
-$env:RUN_REAL_INTENT_EVAL = '1'
-npm.cmd test -- tests/intent-eval.test.ts -t 'Workers AI'
-Remove-Item Env:RUN_REAL_INTENT_EVAL
+$env:RUN_REAL_DIALOGUE_EVAL = '1'
+npm.cmd test -- tests/webhook.test.ts -t 'Workers AI dialogue'
+Remove-Item Env:RUN_REAL_DIALOGUE_EVAL
 ```
 
 ## 設定と本番反映
 
 - `wrangler.jsonc` の `ai.binding` は `AI`、`vars.AI_MODEL` の初期値は `@cf/qwen/qwen3-30b-a3b-fp8` です。日本語と JSON 出力をサポートする Workers AI モデルを指定してください。Workers AI バインディングはアカウントに紐づき、専用の API キーを Worker に置く必要はありません。ローカルで実推論を試す場合は Workers AI を利用できるアカウントで `npx.cmd wrangler login` してください。[モデル仕様](https://developers.cloudflare.com/workers-ai/models/qwen3-30b-a3b-fp8/)
-- 承認後、`wrangler.jsonc` の D1 ID を実際のものに置き換え、`npx.cmd wrangler d1 migrations apply DB --remote` で `0008` までの未適用分を適用します。ローカルでは `npx.cmd wrangler d1 migrations apply DB --local` を使います。既存のタスク・送信履歴は保持されます。新バージョンで旧2本の Cron が無効になり、毎分 Cron が有効になったことを確認します。移行前に旧方式で同日の前日通知が受理されたか不明な場合も、重複防止のため同じ前日20時の枠をスキップします。
+- 承認後、`wrangler.jsonc` の D1 ID を実際のものに置き換え、`npx.cmd wrangler d1 migrations apply DB --remote` で `0009` までの未適用分を適用します。ローカルでは `npx.cmd wrangler d1 migrations apply DB --local` を使います。既存のタスク・送信履歴は保持されます。新バージョンで旧2本の Cron が無効になり、毎分 Cron が有効になったことを確認します。移行前に旧方式で同日の前日通知が受理されたか不明な場合も、重複防止のため同じ前日20時の枠をスキップします。
 - LINE Secrets を Git 管理外の `.env.production` に設定して `npx.cmd wrangler deploy --secrets-file .env.production` で手動反映します。テストグループで登録・通知・引用返信を確認後、家族グループで使います。通知の通数は LINE のプラン、推論は Workers AI の利用量に応じます。[LINE の料金](https://developers.line.biz/ja/docs/messaging-api/pricing/) · [Workers AI 料金](https://developers.cloudflare.com/workers-ai/platform/pricing/)
