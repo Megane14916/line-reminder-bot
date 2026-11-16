@@ -18,32 +18,33 @@ set_group_default: rule（これから登録するタスクの既定値）。使
 category は提出物なら deadline、持ち物なら belonging。
 target は {"by":"name","name":"英検"}（任意のdueDateで期限を絞る）、本文に実在する #123 があるときのみ {"by":"id","id":123}、省略や近い文脈なら {"by":"recent"}。「英検申し込みの通知の方法について」「英検のやつ」「英検申し込むやつ」は自然な操作文。かぎ括弧は不要。nameには本文にある識別に必要なタスク名または特徴的な単語を入れる。「のやつ」「の通知」等は含めず、名前を創作しない。「さっきのやつ」「この申し込み」「これ終わった」「やっぱ前日だけでいいや」は recent。引用元があっても、本文に明示されたタスク名は name として抽出する。
 参照データの task は最新の設定。過去のやり取りは意図の補助。upcoming は UTC、日付と時刻の指定は日本時間。
-本文にタスク名がなければ必ず target={"by":"recent"}。参照データの名前や内部IDを target にコピーしない。task.focus.after は直前に実際に選んだ枠。指示が「その」「さっき」「それじゃなくて」なら selector は {"kind":"recent"} とする。推測で日付・時刻を埋めない。
+本文にタスク名がなければ必ず target={"by":"recent"}。参照データの名前や内部IDを target にコピーしない。task.focus.after は直前に選んだ枠。引用はタスクの特定に使い、引用だけで時刻変更を個別にしない。「この通知」「さっき追加した通知」と明示された場合は selector={"kind":"recent"}。推測で日付・時刻を埋めない。
 DATE = {"kind":"relative","daysBefore":7,"time":"20:00"} または {"kind":"absolute","date":"2026-11-16","time":"00:35"}。前日は1、締切当日は0。月日を含む日付、今日、明日、来週月曜は absolute。月日と時刻を落としたり、締切を基準に日数へ変換しない。年省略は現在の日本の年を使用。11・12月から見た1・2月は翌年。日付を解析できなければ day。
 参照データの calendarEvidence にある date と time は、本文に明示された絶対日時。明日・来週月曜もそこにある YYYY-MM-DD を使用する。
-SELECTOR = DATE、{"kind":"time","time":"08:00"}、または {"kind":"recent"}（さっき追加した・その通知・単に時刻だけ変える場合）。日だけ指定なら time は省略。
+SELECTOR = DATE、{"kind":"time","time":"08:00"}、または {"kind":"recent"}（明示的に参照する通知）。日だけ指定なら time は省略。「この通知の8時を9時に」のように変更元も明示した場合は recent に time を付ける。
 edits の形式:
 - {"op":"add","when":DATE}。「にも」「も追加」「そのままで」は追加。時刻が省略されたら time フィールドを出さない。TypeScript が最新ルール・会話から決める。「朝8時にも」のように日付なしで時刻だけの追加は {"op":"add_clock","time":"08:00"}。
 - {"op":"remove","selector":SELECTOR}。「前日の通知は消して」は {"kind":"relative","daysBefore":1}。「その通知だけ消して」は recent。通知全部が不要なら disable_reminder。
-- {"op":"move","selector":SELECTOR,"to":DATE または {"kind":"time","time":"09:00"}}。「8時じゃなくて9時」は selector が time 08:00、to が time 09:00。「通知を21時にして」は selector recent、to は time 21:00。「それじゃなくて3日前」は recent から relative 3。旧時刻は必ず保持する。存在や重複の判定は TypeScript に任せる。
+- {"op":"move","selector":SELECTOR,"to":DATE または {"kind":"time","time":"09:00"}} は日付や「この通知だけ」で特定した枠の変更。「7日前の通知だけ9時にして」は relative 7 → time 09:00。「それじゃなくて3日前」は recent → relative 3。引用や直近の操作があるだけでは個別にしない。
 - {"op":"shift","selector":{"kind":"recent"},"minutes":60} は「追加したやつを1時間遅くして」。
 - {"op":"undo_remove"} は「いや、今のは消さないで」。
-- {"op":"set_clock","time":"21:00"} は「全部」「すべて」などが明示された時刻変更だけ。
+- {"op":"set_clock","time":"21:00"} は時刻だけを指定する全体変更。「全部」は省略できる。「8時じゃなくて9時に通知して」は set_clock 09:00。8時があるかは問わない。「通知を21時にして」「やっぱ9時」も同様。例外を明示した「全部9時、前日の20時はそのまま」なら except:[{"kind":"relative","daysBefore":1,"time":"20:00"}] を指定する。
 - {"op":"repeat","recurrence":{"startDaysBefore":14,"endDaysBefore":1,"everyDays":7,"weekdays":[]}} は「2週間前くらいから毎週」。曜日を指定した毎週は everyDays:1 と曜日番号を使う。時刻が明示されれば recurrence.time を付ける。
 - {"op":"replace","rule":RULE} は「前日だけ」など全体を置き換える意思が明確な場合。設定の停止と再開を他操作と組み合わせる場合は {"op":"stop"} / {"op":"resume"}。
-「前日はそのまま」など維持する枠は edits に入れない。指定された削除と追加は両方入れる。「当日ではなく11月16日」など同じ通知の訂正は move で表す。
+維持する枠を add に含めない。指定された削除と追加は両方入れる。「当日ではなく11月16日」など同じ通知の訂正は move で表す。明確に「通知して」と依頼する設定変更は再開も意味するが、「設定だけ」「停止したまま」は優先して停止を維持する。再開の判定は TypeScript が行う。
 例:
 「英検申し込みの通知の方法について、2週間前にも通知して」「英検申し込み、2週間前にも教えて」→ {"type":"edit_notifications","target":{"by":"name","name":"英検申し込み"},"edits":[{"op":"add","when":{"kind":"relative","daysBefore":14}}]}
 「さっきのやつ、14日前も」「2週間前にも」→ {"type":"edit_notifications","target":{"by":"recent"},"edits":[{"op":"add","when":{"kind":"relative","daysBefore":14}}]}
 「11/16 0:35にも通知して」（現在2026年）→ {"type":"edit_notifications","target":{"by":"recent"},"edits":[{"op":"add","when":{"kind":"absolute","date":"2026-11-16","time":"00:35"}}]}
 「当日の0:35は消して、11月16日の0:35にして」（現在2026年）→ {"type":"edit_notifications","target":{"by":"recent"},"edits":[{"op":"remove","selector":{"kind":"relative","daysBefore":0,"time":"00:35"}},{"op":"add","when":{"kind":"absolute","date":"2026-11-16","time":"00:35"}}]}
 「2週間前くらいから毎週通知して」→ {"type":"edit_notifications","target":{"by":"recent"},"edits":[{"op":"repeat","recurrence":{"startDaysBefore":14,"endDaysBefore":1,"everyDays":7,"weekdays":[]}}]}
-「さっきのやつ、やっぱ19時にして」→ {"type":"edit_notifications","target":{"by":"recent"},"edits":[{"op":"move","selector":{"kind":"recent"},"to":{"kind":"time","time":"19:00"}}]}
+「さっきのやつ、やっぱ19時にして」→ {"type":"edit_notifications","target":{"by":"recent"},"edits":[{"op":"set_clock","time":"19:00"}]}
+「この通知だけ9時にして」→ {"type":"edit_notifications","target":{"by":"recent"},"edits":[{"op":"move","selector":{"kind":"recent"},"to":{"kind":"time","time":"09:00"}}]}
 「7日前は消して3日前にして」→ {"type":"edit_notifications","target":{"by":"recent"},"edits":[{"op":"move","selector":{"kind":"relative","daysBefore":7},"to":{"kind":"relative","daysBefore":3}}]}
 「7日前と前日の通知を消して」→ {"type":"edit_notifications","target":{"by":"recent"},"edits":[{"op":"remove","selector":{"kind":"relative","daysBefore":7}},{"op":"remove","selector":{"kind":"relative","daysBefore":1}}]}
 「前日の通知も追加して、通知は止めて」→ {"type":"edit_notifications","target":{"by":"recent"},"edits":[{"op":"add","when":{"kind":"relative","daysBefore":1}},{"op":"stop"}]}
 「朝8時にも通知して」→ {"type":"edit_notifications","target":{"by":"recent"},"edits":[{"op":"add_clock","time":"08:00"}]}
-「英検のやつっていつ通知される？」→ {"type":"get_reminder","target":{"by":"name","name":"英検"}}
+「英検のやつっていつ通知される？」「英検、12月7日の20時に通知がある？」→ {"type":"get_reminder","target":{"by":"name","name":"英検"}}
 「7日前はいらない」→ {"type":"edit_notifications","target":{"by":"recent"},"edits":[{"op":"remove","selector":{"kind":"relative","daysBefore":7}}]}
 「これ終わった」→ {"type":"complete_task","target":{"by":"recent"}}
 引用返信「この申し込みは15日までにして」（参照データの dueDate が2030-12-14）→ {"type":"update_task","target":{"by":"recent"},"dueDate":"2030-12-15"}

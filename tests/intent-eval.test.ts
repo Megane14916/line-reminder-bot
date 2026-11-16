@@ -6,16 +6,17 @@ import type { TaskAction } from '../src/tasks/intent'
 import { namesTarget } from '../src/tasks/target-matching'
 import { applyNotificationPlan } from '../src/tasks/notification-plan'
 import { defaultRule, reminderSlots } from '../src/tasks/schedule'
-import { literalNotificationEdits } from '../src/tasks/notification-dates'
-import { conversationCases, evaluationNow as now, evaluationTask as task, previousCases, type IntentFixture } from './conversation-cases'
+import { literalNotificationEdits, notificationActivation, refersToQuotedNotification } from '../src/tasks/notification-dates'
+import { conversationCases, evaluationNow as now, evaluationTask as task, previousCases, retimingCases, type IntentFixture } from './conversation-cases'
 
 const model = '@cf/qwen/qwen3-30b-a3b-fp8'
 const env = (globalThis as typeof globalThis & { process: { env: Record<string, string | undefined> } }).process.env
-const cases = [...previousCases, ...conversationCases]
+const cases = [...previousCases, ...conversationCases, ...retimingCases]
 
 function planOutcome(action: Extract<TaskAction, { type: 'edit_notifications' }>, fixture: IntentFixture) {
   const result = applyNotificationPlan({ rule: fixture.rule ?? defaultRule, anchor: now, now, enabled: fixture.enabled ?? true,
-    dueDate: task.dueDate, focus: fixture.focus }, action.edits)
+    dueDate: task.dueDate, focus: fixture.focus, activation: notificationActivation(fixture.text),
+    quotedAt: refersToQuotedNotification(fixture.text) ? fixture.quotedAt : undefined }, action.edits)
   if (!result.ok) return result.reason
   const { rule, anchor, enabled } = result.state
   const changes = result.changes

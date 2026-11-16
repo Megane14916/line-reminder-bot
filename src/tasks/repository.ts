@@ -12,6 +12,7 @@ export type TaskEvent = {
   groupId: string; userId: string; eventId: string; eventTime: number; now: number
   text?: string
   quoteTaskId?: number | null
+  quotedAt?: number | null
   linkTask?: boolean
   observedTask?: { id: number; version: number }
   history?: ConversationEntry[]
@@ -19,7 +20,7 @@ export type TaskEvent = {
   inbox?: { receiptId: number; leaseToken: string; canCommit: () => boolean }
 }
 export type TaskContext = { task_id: number | null; pending_json: string | null }
-export type PendingClarification = { kind: 'clarification'; question: Clarification; text: string; quoteTaskId?: number | null }
+export type PendingClarification = { kind: 'clarification'; question: Clarification; text: string; quoteTaskId?: number | null; quotedAt?: number | null }
 export type PendingContext = PendingClarification | { kind?: never; action: unknown; ids: number[] }
 const taskListLimit = 20
 
@@ -73,11 +74,11 @@ export function getTask(db: D1Database, groupId: string, id: number) {
   return db.prepare('SELECT * FROM tasks WHERE group_id = ? AND id = ?').bind(groupId, id).first<Task>()
 }
 
-export const sentMessage = `SELECT task_id FROM operation_result_outbox WHERE group_id = ? AND line_message_id = ? AND status = 'sent'
-  UNION ALL SELECT task_id FROM reminder_occurrences WHERE group_id = ? AND line_message_id = ? AND status = 'sent'`
+export const sentMessage = `SELECT task_id, NULL AS scheduled_at FROM operation_result_outbox WHERE group_id = ? AND line_message_id = ? AND status = 'sent'
+  UNION ALL SELECT task_id, scheduled_at FROM reminder_occurrences WHERE group_id = ? AND line_message_id = ? AND status = 'sent'`
 
 export function getBotMessage(db: D1Database, groupId: string, messageId: string) {
-  return db.prepare(sentMessage).bind(groupId, messageId, groupId, messageId).first<{ task_id: number | null }>()
+  return db.prepare(sentMessage).bind(groupId, messageId, groupId, messageId).first<{ task_id: number | null; scheduled_at: number | null }>()
 }
 
 export function pendingContext(context: TaskContext | null) {

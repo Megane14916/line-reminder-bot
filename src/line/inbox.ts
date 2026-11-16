@@ -4,7 +4,7 @@ import { askClarification, isClarificationAnswer } from '../tasks/clarification'
 import { findTasks, finishInboxEvent, getBotMessage, getContext, getTask, mentionedTask, pendingContext, sentMessage, wasProcessed,
   type TaskEvent } from '../tasks/repository'
 import { conversationHistory, notificationFocus } from '../tasks/conversation'
-import { literalNotificationEdits, validateNotificationIntent } from '../tasks/notification-dates'
+import { literalNotificationEdits, notificationDateQuery, validateNotificationIntent } from '../tasks/notification-dates'
 import { reminderSlots, ruleSchema } from '../tasks/schedule'
 import { cleanTargetReference, namesTarget } from '../tasks/target-matching'
 import { aiTimeout, runtimeBudget, type RuntimeBudget } from '../runtime-budget'
@@ -143,10 +143,12 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
         if (pending.question !== 'task' || (await findTasks(db, event.groupId, text.trim(), undefined, false))?.length) {
           original = pending.text
           event.quoteTaskId = pending.quoteTaskId
+          event.quotedAt = pending.quotedAt
           if (pending.question === 'task') answeredTask = text.trim()
         }
       }
       if (quote && event.quoteTaskId === undefined) event.quoteTaskId = quote.task_id
+      if (quote && event.quotedAt === undefined) event.quotedAt = quote.scheduled_at
       event.text = original ? original + '\n補足：' + text : text
       if ((input.type === 'followup' && !original) || (input.type === 'quote' && !quote && !input.mentioned)
         || (quote && /^(?:ありがとう(?:ございます)?|了解(?:です)?|OK)[。！!]*$/i.test(text))) {
@@ -160,16 +162,18 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
       const contextualTask = named ?? (contextualId ? await getTask(db, event.groupId, contextualId) : null)
       if (contextualTask) event.observedTask = { id: contextualTask.id, version: contextualTask.reminder_version }
       const quick = quote?.task_id && !original ? quickQuotedIntent(text) : undefined
-      const literal = contextualTask && !original ? literalNotificationEdits(text, event.eventTime) : undefined
+      const literal = original ? undefined : literalNotificationEdits(text, event.eventTime)
       if (quick && quote?.task_id) {
         action = { ...quick, target: { by: 'id', id: quote.task_id } }
       } else if (row.action_json) {
         const saved = JSON.parse(row.action_json)
         if (saved.action) event.observedTask = saved.observedTask
         action = intentSchema.parse(saved.action ?? saved)
-      } else if (literal && contextualTask) {
+      } else if (literal) {
         action = intentSchema.parse({ type: 'edit_notifications',
-          target: { by: 'id', id: contextualTask.id }, edits: literal })
+          target: contextualTask ? { by: 'id', id: contextualTask.id } : { by: 'recent' }, edits: literal })
+      } else if (!original && notificationDateQuery(text, event.eventTime, false)) {
+        action = { type: 'get_reminder', target: contextualTask ? { by: 'id', id: contextualTask.id } : { by: 'recent' } }
       } else {
         const rule = contextualTask ? ruleSchema.parse(JSON.parse(contextualTask.reminder_rule)) : undefined
         const timeout = Math.min(aiTimeout(env), budget.remaining() - 3000)

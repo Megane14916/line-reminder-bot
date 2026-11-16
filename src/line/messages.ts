@@ -125,6 +125,13 @@ export function formatReminderSettings(heading: string, title: string, reminder:
     reminderDetails(reminder, now, true)].join('\n')
 }
 
+export function formatReminderDateQuery(title: string, date: string, scheduled: number[], active: boolean, now: number) {
+  const dateLabel = formatTaskDate(date, now)
+  const times = scheduled.map((at) => time.format(at)).join('・')
+  const result = times ? `${dateLabel}の設定：${times}` : `${dateLabel}に該当する通知はありません。`
+  return `${formatTaskMessage('🔔 指定日の通知設定', title)}\n${result}${active ? '' : '\n通知：停止中'}`
+}
+
 export function formatGroupReminderSettings(rule: ReminderRule) {
   const summary = rule.type === 'repeat' ? formatRepeat(rule, '登録日')
     : rule.type === 'offsets' ? formatOffsets(rule.slots)

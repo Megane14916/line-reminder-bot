@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest'
-import { explicitNotificationDates, literalNotificationEdits, validateNotificationIntent } from '../src/tasks/notification-dates'
+import { explicitNotificationDates, literalNotificationEdits, notificationActivation, validateNotificationIntent } from '../src/tasks/notification-dates'
 import { applyNotificationPlan, type NotificationEdit, type NotificationSlot } from '../src/tasks/notification-plan'
 import { defaultRule, reminderSlots, type ReminderRule } from '../src/tasks/schedule'
 
@@ -89,14 +89,16 @@ test('supports two removals, additions and edits to one recurring occurrence', (
     extraSlots: [{ daysBefore: 14, time: '09:00' }, { daysBefore: 4, time: '13:00' }] } } })
 })
 
-test('grounding rejects dropped dates, swapped edits, wrong clocks and non-explicit global changes', () => {
+test('grounding rejects dropped dates, swapped edits, and wrong clocks or scope', () => {
   const wrong = make([{ op: 'add', when: relative(0, '00:35') }])
   expect(validateNotificationIntent(wrong, '11/16 0:35にも通知して', now)).toEqual({ type: 'clarify', question: 'day' })
   const exact = make([{ op: 'add', when: absolute('2026-11-16', '00:35') }])
   expect(validateNotificationIntent(exact, '11/16 0:35にも通知して', now)).toEqual(exact)
   expect(validateNotificationIntent(exact, '11/16 0:36にも通知して', now)).toEqual({ type: 'clarify', question: 'day' })
   expect(validateNotificationIntent(make([{ op: 'set_clock', time: '09:00' }]), '8時じゃなくて9時に通知して', now))
-    .toEqual({ type: 'clarify', question: 'day' })
+    .toEqual(make([{ op: 'set_clock', time: '09:00' }]))
+  expect(validateNotificationIntent(make([{ op: 'set_clock', time: '09:00' }]), '7日前の通知だけ9時にして', now))
+    .toEqual(make([{ op: 'move', selector: { kind: 'relative', daysBefore: 7 }, to: { kind: 'time', time: '09:00' } }]))
   expect(validateNotificationIntent(make([{ op: 'remove', selector: absolute('2026-11-16', '00:35') },
     { op: 'add', when: relative(0, '00:35') }]), '当日の0:35は消して、11月16日の0:35にして', now))
     .toEqual({ type: 'clarify', question: 'day' })
@@ -128,4 +130,90 @@ test('an absolute and relative occurrence can share a send while their dates fol
   expect(reminderSlots(rule, dueDate, now, now, 10)).toEqual([Date.parse('2026-12-13T20:00:00+09:00')])
   expect(reminderSlots(rule, '2026-12-15', now, now, 10)).toEqual(
     ['2026-12-13T20:00:00+09:00', '2026-12-14T20:00:00+09:00'].map(Date.parse))
+})
+
+const mixedClocks = offsets([{ daysBefore: 14, time: '08:00' }, { daysBefore: 7, time: '20:00' }, { daysBefore: 1, time: '20:00' }])
+test.each([
+  ['8時じゃなくて9時に通知して', '09:00'],
+  ['通知時間を9時にして', '09:00'],
+  ['やっぱ朝7時で', '07:00'],
+  ['20時じゃなくて21時でお願い', '21:00'],
+  ['通知は全部19時にして', '19:00'],
+])('%s changes all notification dates, independent of a recent focus', (text, time) => {
+  const edits = literalNotificationEdits(text, now)
+  expect(edits).toEqual([{ op: 'set_clock', time }])
+  expect(applyNotificationPlan({ ...state(mixedClocks), focus: { after: relative(14, '08:00') } }, edits!))
+    .toMatchObject({ ok: true, state: { rule: offsets([14, 7, 1].map((daysBefore) => ({ daysBefore, time }))) } })
+})
+
+test('specific scope uses a known occurrence or asks instead of using a different focus in a summary quote', () => {
+  const text = 'この通知だけ9時にして'
+  const edits = literalNotificationEdits(text, now)!
+  const contextual = { ...state(mixedClocks), focus: { after: relative(14, '08:00') } }
+  expect(edits).toEqual([{ op: 'move', selector: { kind: 'recent' }, to: { kind: 'time', time: '09:00' } }])
+  expect(applyNotificationPlan({ ...contextual, quotedAt: Date.parse('2026-12-07T20:00:00+09:00') }, edits))
+    .toMatchObject({ ok: true, changes: [{ before: relative(7, '20:00'), after: relative(7, '09:00') }] })
+  expect(applyNotificationPlan({ ...contextual, quotedAt: null }, edits)).toMatchObject({ ok: false, reason: 'missing', destinationTime: '09:00' })
+  expect(applyNotificationPlan(contextual, edits)).toMatchObject({ ok: true, changes: [{ after: relative(14, '09:00') }] })
+  expect(applyNotificationPlan(contextual, literalNotificationEdits('この通知については、7時じゃなくて9時に通知して', now)!))
+    .toMatchObject({ ok: false, reason: 'missing' })
+})
+
+test('matches and de-duplicates absolute dates by real delivery time while preserving the rule kind on a move', () => {
+  const date = '2026-12-07'
+  const selected = absolute(date, '20:00')
+  const old = state(mixedClocks)
+  expect(applyNotificationPlan(old, [{ op: 'add', when: selected }])).toMatchObject({ ok: true, state: { rule: mixedClocks }, changes: [] })
+  expect(applyNotificationPlan(old, [{ op: 'remove', selector: selected }]))
+    .toMatchObject({ ok: true, state: { rule: offsets([{ daysBefore: 14, time: '08:00' }, { daysBefore: 1, time: '20:00' }]) } })
+  expect(applyNotificationPlan(old, literalNotificationEdits('12月7日の通知だけ9時にして', now)!))
+    .toMatchObject({ ok: true, state: { rule: { slots: expect.arrayContaining([{ daysBefore: 7, time: '09:00' }]) } } })
+  const colliding: ReminderRule = { ...mixedClocks as Extract<ReminderRule, { type: 'offsets' }>, absoluteSlots: [{ date, time: '20:00' }] }
+  const moved = applyNotificationPlan(state(colliding), [{ op: 'move', selector: selected, to: { kind: 'time', time: '09:00' } }])
+  expect(moved).toMatchObject({ ok: true, state: { rule: { absoluteSlots: [{ date, time: '09:00' }],
+    slots: expect.arrayContaining([{ daysBefore: 7, time: '09:00' }]) } } })
+  const removed = applyNotificationPlan(state(colliding), [{ op: 'remove', selector: selected }])
+  expect(removed).toMatchObject({ ok: true, state: { rule: { absoluteSlots: [], slots: [
+    { daysBefore: 14, time: '08:00' }, { daysBefore: 1, time: '20:00' },
+  ] } } })
+})
+
+test('an absolute deletion on a recurring date excludes only that occurrence', () => {
+  const weekly: ReminderRule = { type: 'repeat', startDaysBefore: 14, endDaysBefore: 7, everyDays: 7, weekdays: [], times: ['20:00'],
+    absoluteSlots: [{ date: '2026-12-07', time: '20:00' }] }
+  const result = applyNotificationPlan(state(weekly), [{ op: 'remove', selector: { kind: 'absolute', date: '2026-12-07' } }])
+  expect(result).toMatchObject({ ok: true, state: { rule: { everyDays: 7, excludedSlots: [{ daysBefore: 7, time: '20:00' }], absoluteSlots: [] } } })
+  if (!result.ok) throw new Error('Expected recurrence check')
+  expect(reminderSlots(result.state.rule, dueDate, now, now, 10)).toEqual([Date.parse('2026-11-30T20:00:00+09:00')])
+})
+
+test('global retiming preserves dates, recurrence interval, weekdays, exclusions, and protected exceptions', () => {
+  const weekly: ReminderRule = { type: 'repeat', startDaysBefore: 14, endDaysBefore: 1, everyDays: 1,
+    weekdays: [1], times: ['08:00', '20:00'], extraSlots: [{ daysBefore: 1, time: '20:00' }],
+    excludedSlots: [{ daysBefore: 7, time: '08:00' }, { daysBefore: 7, time: '20:00' }],
+    absoluteSlots: [{ date: '2026-11-22', time: '08:00' }, { date: '2026-11-22', time: '20:00' }] }
+  expect(applyNotificationPlan(state(weekly), [{ op: 'set_clock', time: '09:00' }])).toMatchObject({
+    ok: true, state: { rule: { ...weekly, times: ['09:00'], excludedSlots: [{ daysBefore: 7, time: '09:00' }],
+      absoluteSlots: [{ date: '2026-11-22', time: '09:00' }], extraSlots: [{ daysBefore: 1, time: '09:00' }] } },
+  })
+  const except = literalNotificationEdits('全部9時にして、前日の通知だけ20時のままにして', now)!
+  expect(applyNotificationPlan(state(mixedClocks), except)).toMatchObject({ ok: true,
+    state: { rule: offsets([{ daysBefore: 14, time: '09:00' }, { daysBefore: 7, time: '09:00' }, { daysBefore: 1, time: '20:00' }]) } })
+  expect(applyNotificationPlan(state(mixedClocks), [{ op: 'remove', selector: { kind: 'relative', daysBefore: 7 } },
+    { op: 'set_clock', time: '21:00' }])).toMatchObject({ ok: true, state: { rule: offsets([
+    { daysBefore: 14, time: '21:00' }, { daysBefore: 1, time: '21:00' },
+  ]) } })
+})
+
+test('activation follows a positive notification request and respects explicit setup-only directions', () => {
+  const paused = { ...state(), enabled: false }
+  const add: NotificationEdit = { op: 'add', when: { kind: 'relative', daysBefore: 3 } }
+  expect(applyNotificationPlan({ ...paused, activation: notificationActivation('3日前にも通知して') }, [add]))
+    .toMatchObject({ ok: true, state: { enabled: true } })
+  expect(applyNotificationPlan({ ...paused, activation: notificationActivation('通知は止めたままで3日前も通知して') }, [add]))
+    .toMatchObject({ ok: true, state: { enabled: false } })
+  expect(applyNotificationPlan({ ...paused, activation: notificationActivation('設定だけ3日前を追加して') }, [add, { op: 'resume' }]))
+    .toMatchObject({ ok: true, state: { enabled: false } })
+  expect(applyNotificationPlan({ ...paused, activation: notificationActivation('前日だけ通知して') },
+    [{ op: 'replace', rule: offsets([{ daysBefore: 1, time: '20:00' }]) }])).toMatchObject({ ok: true, state: { enabled: true } })
 })

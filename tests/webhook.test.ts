@@ -563,8 +563,8 @@ test('updates, completes, reopens, logically deletes, restores and manages notif
   expect(await command('やっぱり3日前と前日だけ', { type: 'set_reminder', target: recent, setting: { by: 'rule',
     rule: { type: 'offsets', slots: [{ daysBefore: 3, time: '20:00' }, { daysBefore: 1, time: '20:00' }] } } }))
     .toContain('通知：3日前・前日 20:00\n次回：12月20日（金）20:00')
-  expect(await command('通知時間を全部21時に変えて', { type: 'set_reminder', target: recent,
-    setting: { by: 'time', time: '21:00' } })).toContain('21:00')
+  await webhook([event('通知時間を全部21時に変えて', { mention: true })])
+  expect(lastReply()).toContain('21:00')
   expect(await command('このタスクはいつ通知？', { type: 'get_reminder', target: recent }))
     .toBe('🔔 通知設定\n\n作文\n期限：12月23日（月）\n通知：3日前・前日 21:00\n次回：12月20日（金）21:00')
   expect(await command('通知停止', { type: 'disable_reminder', target: recent })).toContain('\n通知：停止中')
@@ -843,7 +843,7 @@ test('resolves a conversational spelling of a task name and changes only the not
   await command('英検を登録', application)
   const found = await command('英検の申し込むやつっていつ通知される？', { type: 'get_reminder', target: byName('英検申し込み') })
   expect(found).toContain('英検申し込み\n期限：12月14日（土）')
-  await command('通知を全部21時にして', edit({ mode: 'change_time', time: '21:00' }))
+  await webhook([event('通知を全部21時にして', { mention: true })])
   const [task] = (await taskRows()).results
   expect(JSON.parse(String(task.reminder_rule))).toEqual({ type: 'offsets',
     slots: [{ ...seventh, time: '21:00' }, { ...eve, time: '21:00' }] })
@@ -865,7 +865,6 @@ const calendarTask = { ...application, dueDate: '2026-12-14' }
 const plan = (...edits: import('../src/tasks/notification-plan').NotificationEdit[]) => ({ type: 'edit_notifications', target: recent, edits })
 const relativeDate = (daysBefore: number, time?: string) => ({ kind: 'relative' as const, daysBefore, time })
 const absoluteDate = (date: string, time: string) => ({ kind: 'absolute' as const, date, time })
-const atTime = (time: string) => ({ kind: 'time' as const, time })
 
 test('reproduces the device conversation and corrects the calendar date atomically in D1', async () => {
   vi.spyOn(Date, 'now').mockReturnValue(calendarNow)
@@ -876,8 +875,8 @@ test('reproduces the device conversation and corrects the calendar date atomical
   expect(await rule()).toMatchObject({ type: 'repeat', startDaysBefore: 14, everyDays: 7, times: ['20:00'], extraSlots: [seventh, eve] })
   const existing = (await taskRows()).results[0]
   expect(await command('前日にも通知して', plan({ op: 'add', when: relativeDate(1) }))).toContain('すでに設定')
-  expect(await command('8時じゃなくて9時に通知して', plan({ op: 'move', selector: atTime('08:00'), to: atTime('09:00') })))
-    .toContain('08:00の通知が見つかりません')
+  await webhook([event('7日前の8時の通知を9時にして', { mention: true })])
+  expect(lastReply()).toContain('08:00の通知が見つかりません')
   expect((await taskRows()).results[0]).toEqual(existing)
   await command('3週間前にも通知して', plan({ op: 'add', when: relativeDate(21) }))
   expect((await rule()).extraSlots).toContainEqual({ daysBefore: 21, time: '20:00' })
@@ -901,12 +900,84 @@ test('reproduces the device conversation and corrects the calendar date atomical
   expect((await taskRows()).results[0]).toMatchObject({ reminder_version: Number(prior.reminder_version) + 1,
     next_reminder_at: Date.parse('2026-11-16T00:35:00+09:00') })
   const corrected = (await taskRows()).results[0]
-  expect(await command('7日前の通知は消して、11/14 0:35にも通知して', plan({ op: 'remove', selector: relativeDate(7) },
-    { op: 'add', when: absoluteDate('2026-11-14', '00:35') }))).toContain('過ぎた日時')
+  await webhook([event('7日前の通知は消して、11/14 0:35にも通知して', { mention: true })])
+  expect(lastReply()).toContain('過ぎた日時')
   expect((await taskRows()).results[0]).toEqual(corrected)
   expect(await command('さっきの期限を12月15日にして', { type: 'update_task', target: recent, dueDate: '2026-12-15' })).toContain('変更しました')
   expect((await rule()).absoluteSlots).toEqual([{ date: '2026-11-16', time: '00:35' }])
 }, 25_000)
+
+test('quotes a registration to change all times and asks about an individual time when the quote is a settings summary', async () => {
+  vi.mocked(Date.now).mockReturnValue(calendarNow)
+  const registration = '987654321000000001'
+  const settings = '987654321000000002'
+  line.mockResolvedValueOnce(new Response(JSON.stringify({ sentMessages: [{ id: registration }] })))
+  await command('英検を登録', calendarTask)
+  await command('14日前にも通知して', plan({ op: 'add', when: relativeDate(14) }))
+  line.mockResolvedValueOnce(new Response(JSON.stringify({ sentMessages: [{ id: settings }] })))
+  await command('今の通知設定を確認したい', { type: 'get_reminder', target: recent })
+  const [before] = (await taskRows()).results
+  await webhook([event('この通知だけ9時にして', { quote: settings })])
+  expect(lastReply()).toBe('🔔 どの通知を09:00に変更しますか？')
+  expect((await taskRows()).results).toEqual([before])
+  await webhook([event('8時じゃなくて9時にして', { quote: registration })])
+  expect(lastReply()).toContain('すべての通知を09:00に変更しました。')
+  const [after] = (await taskRows()).results
+  expect(JSON.parse(String(after.reminder_rule)).slots).toEqual([14, 7, 1].map((daysBefore) => ({ daysBefore, time: '09:00' })))
+}, 15_000)
+
+test('quotes the saved time of a single sent reminder and moves that occurrence only', async () => {
+  vi.mocked(Date.now).mockReturnValue(calendarNow)
+  const moveAt = Date.parse('2026-12-07T08:00:00+09:00')
+  const quote = '987654321000000003'
+  await command('英検を登録', { ...calendarTask, rule: { type: 'offsets', slots: [{ daysBefore: 7, time: '08:00' }, eve] } })
+  vi.mocked(Date.now).mockReturnValue(moveAt)
+  line.mockResolvedValueOnce(new Response(JSON.stringify({ sentMessages: [{ id: quote }] })))
+  await runReminders(webhookEnv(), () => moveAt)
+  expect(await platform.env.DB.prepare('SELECT scheduled_at FROM reminder_occurrences WHERE line_message_id = ?')
+    .bind(quote).first('scheduled_at')).toBe(moveAt)
+  await webhook([event('この通知だけ9時にして', { quote })])
+  expect(lastReply()).toContain('変更：7日前 08:00 → 7日前 09:00')
+  const [task] = (await taskRows()).results
+  expect(task.next_reminder_at).toBe(moveAt + 60 * 60_000)
+  expect(JSON.parse(String(task.reminder_rule)).slots).toEqual([{ daysBefore: 7, time: '09:00' }, eve])
+  expect(infer).toHaveBeenCalledTimes(1)
+}, 15_000)
+
+test('matches a calendar lookup to a relative slot and commits compound edits once', async () => {
+  vi.mocked(Date.now).mockReturnValue(calendarNow)
+  await command('英検を登録', calendarTask)
+  const [before] = (await taskRows()).results
+  await webhook([event('12月7日の20時に通知がある？', { mention: true })])
+  expect(lastReply()).toContain('12月7日（月）の設定：20:00')
+  const keep = event('全部9時にして、前日の通知だけ20時のままにして', { mention: true })
+  await Promise.all([webhook([keep]), webhook([keep])])
+  const [changed] = (await taskRows()).results
+  expect(changed.reminder_version).toBe(Number(before.reminder_version) + 1)
+  expect(JSON.parse(String(changed.reminder_rule)).slots).toEqual([{ daysBefore: 7, time: '09:00' }, eve])
+  await webhook([event('12月7日の通知を削除して、3日前の朝8時も追加して', { mention: true })])
+  const [after] = (await taskRows()).results
+  expect(after.reminder_version).toBe(Number(changed.reminder_version) + 1)
+  expect(JSON.parse(String(after.reminder_rule)).slots).toEqual([{ daysBefore: 3, time: '08:00' }, eve])
+}, 15_000)
+
+test('keeps settings-only edits paused and resumes future reminders without reopening a completed task', async () => {
+  vi.mocked(Date.now).mockReturnValue(Date.parse('2026-12-08T10:00:00+09:00'))
+  await command('英検を登録', { ...calendarTask, rule: { type: 'offsets', slots: [seventh, eve] } })
+  await command('通知はもういらない', { type: 'disable_reminder', target: recent })
+  expect(await command('設定だけ3日前を追加して', plan({ op: 'add', when: relativeDate(3) }))).toContain('通知：停止中')
+  await webhook([event('まだ通知しないで', { mention: true })])
+  expect(lastReply()).toContain('通知：停止中')
+  expect((await taskRows()).results[0]).toMatchObject({ reminder_enabled: 0, next_reminder_at: null })
+  expect(await command('やっぱり3日前にも通知して', plan({ op: 'add', when: relativeDate(3) }))).toContain('通知を再開しました。')
+  expect((await taskRows()).results[0]).toMatchObject({ reminder_enabled: 1, next_reminder_at: Date.parse('2026-12-11T20:00:00+09:00') })
+  expect(pushes()).toHaveLength(0)
+  await command('英検終わった', { type: 'complete_task', target: byName('英検') })
+  await webhook([event('これから朝9時に通知して', { mention: true })])
+  expect((await taskRows()).results[0]).toMatchObject({ status: 'done', next_reminder_at: null })
+  expect(lastReply()).toContain('通知：停止中')
+  expect(lastReply()).not.toContain('通知を再開')
+}, 20_000)
 
 test('passes scoped live state and recent operations, inherits a changed clock, and expires conversation', async () => {
   vi.spyOn(Date, 'now').mockReturnValue(calendarNow)
@@ -914,7 +985,7 @@ test('passes scoped live state and recent operations, inherits a changed clock, 
     { daysBefore: 7, time: '08:00' }, { daysBefore: 1, time: '20:00' },
   ] } }
   await command('英検を登録', setup)
-  await command('8時じゃなくて9時に通知して', plan({ op: 'move', selector: atTime('08:00'), to: atTime('09:00') }))
+  await webhook([event('7日前の8時の通知を9時にして', { mention: true })])
   expect(lastReply()).toContain('変更：7日前 08:00 → 7日前 09:00')
   await command('3週間前にも通知して', plan({ op: 'add', when: relativeDate(21) }))
   const aiCall = infer.mock.lastCall?.[1] as { messages: { content: string }[] }

@@ -6,7 +6,7 @@ export async function askClarification(db: D1Database, event: TaskEvent, questio
   const reply = prompt ?? formatIntentError(question)
   if (!event.text) return reply
   const context = await getContext(db, event)
-  const pending: PendingClarification = { kind: 'clarification', question, text: event.text, quoteTaskId: event.quoteTaskId }
+  const pending: PendingClarification = { kind: 'clarification', question, text: event.text, quoteTaskId: event.quoteTaskId, quotedAt: event.quotedAt }
   if (await applyEvent(db, { ...event, linkTask: taskId !== undefined, turn: { operation: 'clarify', question: reply } }, reply,
     saveContext(db, event, 'clarification', taskId ?? context?.task_id ?? null, JSON.stringify(pending)))) return reply
 }

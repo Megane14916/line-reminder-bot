@@ -8,7 +8,7 @@ const relative = z.strictObject({ kind: z.literal('relative'), daysBefore: offse
 const absolute = z.strictObject({ kind: z.literal('absolute'), date: z.iso.date(), time: timeSchema.optional() })
 const clock = z.strictObject({ kind: z.literal('time'), time: timeSchema })
 const dateSpec = z.discriminatedUnion('kind', [relative, absolute])
-const selector = z.discriminatedUnion('kind', [relative, absolute, clock, z.strictObject({ kind: z.literal('recent') })])
+const selector = z.discriminatedUnion('kind', [relative, absolute, clock, z.strictObject({ kind: z.literal('recent'), time: timeSchema.optional() })])
 const recurrence = z.strictObject({ startDaysBefore: offset.nullable(), endDaysBefore: offset, everyDays: z.number().int().min(1).max(366),
   weekdays: z.array(z.number().int().min(0).max(6)).max(7), time: timeSchema.optional() })
 export const notificationEditSchema = z.discriminatedUnion('op', [
@@ -19,7 +19,7 @@ export const notificationEditSchema = z.discriminatedUnion('op', [
   z.strictObject({ op: z.literal('shift'), selector, minutes: z.number().int().min(-1440).max(1440) }),
   z.strictObject({ op: z.literal('repeat'), recurrence }),
   z.strictObject({ op: z.literal('replace'), rule: ruleSchema }),
-  z.strictObject({ op: z.literal('set_clock'), time: timeSchema }),
+  z.strictObject({ op: z.literal('set_clock'), time: timeSchema, except: z.array(dateSpec).min(1).max(8).optional() }),
   z.strictObject({ op: z.literal('stop') }),
   z.strictObject({ op: z.literal('resume') }),
   z.strictObject({ op: z.literal('undo_remove') }),
@@ -30,11 +30,14 @@ export type NotificationDate = z.infer<typeof dateSpec>
 export type NotificationSlot = NotificationDate & { time: string }
 type Selector = z.infer<typeof selector>
 export type TimeSource = 'explicit' | 'conversation' | 'current' | 'group' | 'default'
-export type NotificationChange = { before?: NotificationSlot; after?: NotificationSlot; timeSource?: TimeSource; summary?: string; reactivate?: boolean }
+export type NotificationChange = { before?: NotificationSlot; after?: NotificationSlot; timeSource?: TimeSource; summary?: string;
+  reactivate?: boolean; resumed?: true }
 type Problem = 'time' | 'day' | 'missing' | 'past' | 'limit' | 'conflict'
 type State = { rule: ReminderRule; anchor: number; enabled: boolean }
-type Input = State & { dueDate: string; now: number; focus?: NotificationChange; defaultTime?: string }
-type Result = { ok: true; state: State; changes: NotificationChange[] } | { ok: false; reason: Problem; time?: string }
+type Input = State & { dueDate: string; now: number; focus?: NotificationChange; defaultTime?: string;
+  quotedAt?: number | null; activation?: 'resume' | 'keep' }
+type Result = { ok: true; state: State; changes: NotificationChange[] } |
+  { ok: false; reason: Problem; time?: string; destinationTime?: string }
 const day = 86_400_000
 const japanClock = new Intl.DateTimeFormat('ja-JP', { timeZone: 'Asia/Tokyo', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
 
@@ -56,28 +59,58 @@ function sameSlot(a: NotificationSlot, b: NotificationSlot) {
   return sameDay(a, b) && a.time === b.time
 }
 
-function occurrences(rule: ReminderRule, input: Input, wanted: Exclude<Selector, { kind: 'recent' }>) {
+function selectedDay(wanted: NotificationDate, dueDate: string) {
+  return wanted.kind === 'absolute' ? jstMidnight(wanted.date) : jstMidnight(dueDate) - wanted.daysBefore * day
+}
+
+type Occurrence = { at: number; slots: NotificationSlot[] }
+type Search = Exclude<Selector, { kind: 'recent' }> | { kind: 'quoted'; at: number }
+
+function occurrences(rule: ReminderRule, input: Input, wanted: Search): Occurrence[] {
+  const calendarDay = wanted.kind === 'time' ? undefined : wanted.kind === 'quoted'
+    ? jstMidnight(todayInJapan(wanted.at)) : selectedDay(wanted, input.dueDate)
+  const wantedTime = wanted.kind === 'quoted' ? japanClock.format(wanted.at) : wanted.time
   const relativeSlots = rule.type === 'default' ? defaultReminderOffsets(input.dueDate, input.anchor)
     : rule.type === 'offsets' ? rule.slots : rule.extraSlots ?? []
   const candidates: NotificationSlot[] = [
     ...relativeSlots.map((s) => ({ kind: 'relative' as const, ...s })),
     ...absoluteReminders(rule).map((s) => ({ kind: 'absolute' as const, ...s })),
   ]
-  if (rule.type === 'repeat' && wanted.kind !== 'absolute') {
-    const times = wanted.time ? rule.times.filter((time) => time === wanted.time) : rule.times
+  if (rule.type === 'repeat') {
+    const times = wantedTime ? rule.times.filter((time) => time === wantedTime) : rule.times
     if (times.length) {
       const series = { ...rule, times, extraSlots: [], absoluteSlots: [] }
-      const after = wanted.kind === 'relative' ? slotTime(jstMidnight(input.dueDate), { daysBefore: wanted.daysBefore, time: '00:00' }) - 1
-        : input.now
-      for (const at of reminderSlots(series, input.dueDate, input.anchor, after, 2 + candidates.length)) {
+      const after = calendarDay === undefined ? input.now : calendarDay - 1
+      for (const at of reminderSlots(series, input.dueDate, input.anchor, after, calendarDay === undefined ? 2 + candidates.length : times.length)) {
+        if (calendarDay !== undefined && at >= calendarDay + day) break
         const daysBefore = (jstMidnight(input.dueDate) - jstMidnight(todayInJapan(at))) / day
         candidates.push({ kind: 'relative', daysBefore, time: japanClock.format(at) })
       }
     }
   }
-  return candidates.filter((candidate, index) =>
-    (wanted.kind === 'time' || sameDay(candidate, wanted)) && (!wanted.time || candidate.time === wanted.time) &&
-    candidates.findIndex((previous) => sameSlot(previous, candidate)) === index)
+  const matches = new Map<number, NotificationSlot[]>()
+  for (const candidate of candidates) {
+    const at = scheduledTime(candidate, input.dueDate)
+    if (calendarDay !== undefined && (at < calendarDay || at >= calendarDay + day) || wantedTime && candidate.time !== wantedTime) continue
+    if (wanted.kind === 'quoted' && at !== wanted.at) continue
+    const slots = matches.get(at) ?? []
+    if (!slots.some((previous) => sameSlot(previous, candidate))) slots.push(candidate)
+    matches.set(at, slots)
+  }
+  return [...matches].map(([at, slots]) => ({ at, slots }))
+}
+
+export function matchingReminderTimes(input: Input, wanted: NotificationDate) {
+  return occurrences(input.rule, input, wanted).map(({ at }) => at).sort((a, b) => a - b)
+}
+
+function withoutOccurrence(rule: ReminderRule, occurrence: Occurrence, input: Input) {
+  let next: ReminderRule | undefined = rule
+  for (const slot of occurrence.slots) {
+    next = removeSlot(next, slot, input)
+    if (!next) return
+  }
+  return next
 }
 
 function withAbsolute(rule: ReminderRule, slots: ReturnType<typeof absoluteReminders>, input: Input): ReminderRule {
@@ -114,12 +147,16 @@ function pickTime(rule: ReminderRule, input: Input, explicit?: string): { time: 
 export function applyNotificationPlan(input: Input, edits: NotificationEdit[]): Result {
   let { rule, anchor, enabled } = input
   const changes: NotificationChange[] = []
-  const reject = (reason: Problem, time?: string): Result => ({ ok: false, reason, time })
+  const reject = (reason: Problem, time?: string, destinationTime?: string): Result => ({ ok: false, reason, time, destinationTime })
+  const resumes = input.activation === 'resume' && edits.some(({ op }) => op === 'add' || op === 'add_clock' ||
+    op === 'set_clock' || op === 'move' || op === 'shift' || op === 'repeat' || op === 'replace')
+  if (resumes) enabled = true
   for (const edit of edits) {
     const current = { ...input, anchor }
     if (edit.op === 'stop' || edit.op === 'resume') {
+      if (edit.op === 'resume' && input.activation === 'keep') continue
       const next = edit.op === 'resume'
-      if (next !== enabled) changes.push({ summary: next ? '通知を再開' : '通知を停止' })
+      if (next !== enabled) changes.push(next ? { summary: '通知を再開', resumed: true } : { summary: '通知を停止' })
       enabled = next
       continue
     }
@@ -141,14 +178,33 @@ export function applyNotificationPlan(input: Input, edits: NotificationEdit[]): 
         if (absoluteReminders(edit.rule).some((slot) => absoluteTime(slot) <= input.now)) return reject('past')
         rule = edit.rule
         anchor = input.now
-        enabled = true
         changes.push({ summary: '通知ルールを置き換え' })
       } else if (edit.op === 'set_clock') {
-        const next = changeReminderTime(rule, edit.time, input.dueDate, anchor)
-        if (absoluteReminders(next).some((slot) => absoluteTime(slot) <= input.now &&
-          !absoluteReminders(rule).some((old) => old.date === slot.date && old.time === slot.time))) return reject('past')
+        let next = changeReminderTime(rule, edit.time, input.dueDate, anchor)
+        for (const exception of edit.except ?? []) {
+          const kept = occurrences(rule, current, exception)
+          if (!kept.length) return reject('missing', exception.time)
+          const originals = occurrences(rule, current, { ...exception, time: undefined })
+          if (originals.length === kept.length && !kept.some((item) => item.slots[0].time === edit.time)) {
+            const changed = occurrences(next, current, { ...exception, time: edit.time })[0]
+            if (changed) {
+              const restored = withoutOccurrence(next, changed, current)
+              if (!restored) return reject('limit')
+              next = restored
+            }
+          }
+          for (const previous of kept.flatMap((item) => item.slots)) {
+            const present = occurrences(next, current, previous).some((item) => item.slots.some((slot) => sameSlot(slot, previous)))
+            if (!present) {
+              const restored = addSlot(next, previous, current)
+              if (!restored) return reject('limit')
+              next = restored
+            }
+          }
+        }
         rule = next
-        changes.push({ summary: `すべての通知を${edit.time}に変更`, timeSource: 'explicit' })
+        changes.push({ summary: edit.except?.length ? `指定した通知を除き、${edit.time}に変更` : `すべての通知を${edit.time}に変更しました。`,
+          timeSource: 'explicit' })
       } else {
         const { time, ...period } = edit.recurrence
         const picked = pickTime(rule, current, time)
@@ -171,16 +227,23 @@ export function applyNotificationPlan(input: Input, edits: NotificationEdit[]): 
     }
 
     let before: NotificationSlot | undefined
+    let source: Occurrence | undefined
     if (edit.op !== 'add' && edit.op !== 'undo_remove') {
-      const wanted = edit.selector.kind === 'recent' ? input.focus?.after : edit.selector
-      const matches = wanted ? occurrences(rule, current, wanted) : []
-      if (!matches.length) return reject('missing', wanted?.time)
+      const wanted: Search | undefined = edit.selector.kind !== 'recent' ? edit.selector
+        : input.quotedAt === undefined ? input.focus?.after : input.quotedAt === null ? undefined : { kind: 'quoted', at: input.quotedAt }
+      const matches = (wanted ? occurrences(rule, current, wanted) : []).filter((item) =>
+        edit.selector.kind !== 'recent' || !edit.selector.time || item.slots[0].time === edit.selector.time)
+      const destinationTime = edit.op === 'move' && edit.to.kind === 'time' ? edit.to.time : undefined
+      const sourceClock = edit.selector.kind === 'recent' ? edit.selector.time : wanted && 'time' in wanted ? wanted.time : undefined
+      if (!matches.length) return reject('missing', sourceClock, destinationTime)
       if (matches.length > 1) {
         const focused = input.focus?.after
-        if (focused && wanted && (wanted.kind === 'time' || sameDay(focused, wanted)) &&
-          (!wanted.time || focused.time === wanted.time) && occurrences(rule, current, focused).length === 1) before = focused
-        if (!before) return reject(wanted?.kind === 'time' ? 'day' : 'time', wanted?.time)
-      } else before = matches[0]
+        if (focused && wanted?.kind === 'time' && focused.time === wanted.time) {
+          source = occurrences(rule, current, focused)[0]
+        }
+        if (!source) return reject(wanted?.kind === 'time' ? 'day' : 'time', sourceClock, destinationTime)
+      } else source = matches[0]
+      before = source.slots[0]
     }
 
     let destination: NotificationDate | undefined
@@ -205,27 +268,33 @@ export function applyNotificationPlan(input: Input, edits: NotificationEdit[]): 
         : destination ? pickTime(rule, current, destination.time) : undefined
     if (destination && !picked) return reject('time')
     const after = destination && picked ? { ...destination, time: picked.time } : undefined
-    if (after && before && sameSlot(before, after)) continue
+    if (after && source && scheduledTime(after, input.dueDate) === source.at) continue
     if (after?.kind === 'absolute' && absoluteTime(after) <= input.now) return reject('past')
     const duplicate = after ? occurrences(rule, current, after).length > 0 : false
     if (!before && duplicate) {
-      if (edit.op === 'undo_remove' && input.focus?.reactivate && !enabled) {
+      if (edit.op === 'undo_remove' && input.focus?.reactivate && !enabled && input.activation !== 'keep') {
         enabled = true
         changes.push({ after, timeSource: picked?.timeSource })
       }
       continue
     }
-    if (before) {
-      const next = removeSlot(rule, before, current)
+    if (source) {
+      const next = withoutOccurrence(rule, source, current)
       if (!next) return reject('limit')
       rule = next
     }
-    if (after && !duplicate) {
-      const next = addSlot(rule, after, current)
-      if (!next) return reject('limit')
-      rule = next
+    const keepsRuleKinds = edit.op === 'move' && edit.to.kind === 'time'
+    if (after && (!duplicate || keepsRuleKinds)) {
+      const destinations = source && keepsRuleKinds
+        ? source.slots.map((slot) => ({ ...slot, time: after.time })) : [after]
+      for (const slot of destinations) {
+        if (occurrences(rule, current, slot).some((item) => item.slots.some((value) => sameSlot(value, slot)))) continue
+        const next = addSlot(rule, slot, current)
+        if (!next) return reject('limit')
+        rule = next
+      }
     }
-    changes.push({ before, after: duplicate ? undefined : after, timeSource: picked?.timeSource })
+    changes.push({ before, after: duplicate && !keepsRuleKinds ? undefined : after, timeSource: picked?.timeSource })
   }
   if (rule.type === 'offsets' && !rule.slots.length && !rule.absoluteSlots?.length) {
     rule = input.rule
@@ -233,5 +302,6 @@ export function applyNotificationPlan(input: Input, edits: NotificationEdit[]): 
     enabled = false
   }
   if (!ruleSchema.safeParse(rule).success) return reject('limit')
+  if (resumes && !input.enabled && enabled) changes.push({ summary: '通知を再開しました。', resumed: true })
   return { ok: true, state: { rule, anchor, enabled }, changes }
 }
