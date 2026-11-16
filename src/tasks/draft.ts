@@ -1,13 +1,15 @@
 import { intentSchema, type DialogueProposal, type DraftEditPatch, type TaskAction, type TaskDraft } from './intent'
 import type { PendingDialogue } from './dialogue'
-import { explicitNotificationDates, explicitNotificationTimes, relativeDays } from './notification-dates'
-import { absoluteReminders, absoluteTime } from './schedule'
+import { explicitNotificationDates, explicitNotificationTimes, notificationPeriod, relativeDays } from './notification-dates'
+import { absoluteReminders, absoluteTime, type ReminderRule } from './schedule'
+import { resolveNotificationClock } from './notification-clock'
+import type { NotificationChange } from './notification-plan'
 import { namesTarget } from './target-matching'
 import { todayInJapan } from './validation'
 import { draftEdits, justifiedRemovals, nextEditQuestion, reconcileEditedDraft } from './draft-edits'
 
 type Evidence = NonNullable<PendingDialogue['evidence']>
-type DraftResult = { action: TaskAction } | { pending: PendingDialogue }
+type DraftResult = { action: TaskAction; change?: NotificationChange } | { pending: PendingDialogue } | { error: string }
 type Continuation = { type?: 'continue' | 'draft'; fields: TaskDraft['fields']; patches?: DraftEditPatch[] }
 
 export function dateTimeEvidence(text: string, now: number) {
@@ -96,7 +98,7 @@ export function reconcileDraft(pending: PendingDialogue & { draft: TaskDraft }, 
 }
 
 export function resolveDraft(draft: TaskDraft, original: string, originalAt: number, text: string, now: number,
-  previous?: PendingDialogue): DraftResult {
+  previous?: PendingDialogue, groupRule?: ReminderRule): DraftResult {
   const originalEvidence = dateTimeEvidence(original, originalAt)
   const answer = dateTimeEvidence(text, now)
   const fields = { ...draft.fields }
@@ -142,13 +144,14 @@ export function resolveDraft(draft: TaskDraft, original: string, originalAt: num
     if (!fields.target) return pending('task', '💬 どのタスクのことですか？')
     const edits = fields.edits ?? []
     if (!justifiedRemovals(edits, editText ?? original, originalAt)) return pending('mode', '🔔 どの通知を変更しますか？')
-    const missing = nextEditQuestion(edits)
+    const missing = nextEditQuestion(edits, true)
     if (missing) return missing.question === 'time' ? pending('time', '🔔 何時に通知しますか？') : pending('day', '🔔 いつ通知しますか？')
     const result = intentSchema.safeParse({ type: 'edit_notifications', target: fields.target, edits })
     return result.success ? { action: result.data } : pending('day', '🔔 いつ通知しますか？')
   }
 
   let { notice } = fields
+  let change: NotificationChange | undefined
   if (notice) {
     if (notice.kind === 'absolute' && (!notice.date || !evidence.dates.includes(notice.date))) {
       return pending('day', '🔔 何日に通知しますか？')
@@ -158,12 +161,13 @@ export function resolveDraft(draft: TaskDraft, original: string, originalAt: num
       notice = { ...notice, time: answer.times[0] }
       fields.notice = notice
     }
-    if (!notice.time || !evidence.times.includes(notice.time)) {
-      const today = notice.kind === 'absolute' && notice.date === todayInJapan(now)
-      return pending('time', today ? '🔔 今日の何時に通知しますか？' : '🔔 何時に通知しますか？')
-    }
-    if (notice.kind === 'absolute' && notice.date && absoluteTime({ date: notice.date, time: notice.time }) <= now) {
-      return pending('time', '🔔 過ぎた時刻です。何時に通知しますか？')
+    const { time, timeSource } = resolveNotificationClock({ dueDate: fields.dueDate!, anchor: now, groupRule,
+      explicit: notice.time && evidence.times.includes(notice.time) ? notice.time : undefined,
+      period: notificationPeriod(text, now) ?? notificationPeriod(original, originalAt) })
+    notice = { ...notice, time }
+    change = { resolvedTime: time, timeSource }
+    if (notice.kind === 'absolute' && notice.date && absoluteTime({ date: notice.date, time }) <= now) {
+      return { error: '🔔 指定した日時はすでに過ぎています。' }
     }
   }
   const rule = notice ? notice.kind === 'absolute'
@@ -175,7 +179,7 @@ export function resolveDraft(draft: TaskDraft, original: string, originalAt: num
   if (checked.type === 'clarify') {
     return checked.question === 'time' ? pending('time', '🔔 何時に通知しますか？') : pending('day', '📅 指定した日付を確認してください。')
   }
-  return { action: checked }
+  return { action: checked, change }
 }
 
 function explicitEvidenceText(evidence: Evidence) {
@@ -206,6 +210,13 @@ function specifiesNotice(text: string, evidence: ReturnType<typeof dateTimeEvide
 
 // An addition or clock proposal can be grounded in the calendar evidence of the current turn.
 export function groundTemporalDraft(action: TaskAction, text: string, now: number, pending?: PendingDialogue): DialogueProposal | undefined {
+  if (action.type === 'create_task' && !pending &&
+    explicitNotificationDates(text, now).every(({ date }) => !date || date !== action.dueDate &&
+      action.rule && absoluteReminders(action.rule).some((slot) => slot.date === date)) &&
+    !/今週|来週|再来週|今月|来月|再来月|月末|年末|(?<!\d)\d{1,2}日(?!前|後|間|おき)/.test(text.normalize('NFKC')) &&
+    action.dueDate >= todayInJapan(now)) {
+    return { type: 'draft', operation: 'create_task', fields: { title: action.title, category: action.category, rule: action.rule } }
+  }
   if (action.type === 'create_task' && !pending && !explicitNotificationTimes(text).length &&
     /(?:今夜|夜に)通知して/.test(text) && explicitNotificationDates(text, now).length === 1 && action.dueDate > todayInJapan(now)) {
     return { type: 'draft', operation: 'create_task', fields: { title: action.title, dueDate: action.dueDate, category: action.category,

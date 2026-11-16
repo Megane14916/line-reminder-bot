@@ -3,6 +3,8 @@ import { editReminder } from './reminder-edits'
 import { absoluteReminders, absoluteTime, changeReminderTime, defaultReminderOffsets, jstMidnight, offset,
   reminderSlots, ruleSchema, slotTime, timeSchema, type ReminderRule } from './schedule'
 import { todayInJapan } from './validation'
+import { notificationClockAt, resolveNotificationClock, type Daypart, type TimeSource } from './notification-clock'
+export type { TimeSource } from './notification-clock'
 
 const relative = z.strictObject({ kind: z.literal('relative'), daysBefore: offset, time: timeSchema.optional() })
 const absolute = z.strictObject({ kind: z.literal('absolute'), date: z.iso.date(), time: timeSchema.optional() })
@@ -20,33 +22,29 @@ export const notificationEditSchema = z.discriminatedUnion('op', [
   z.strictObject({ op: z.literal('shift'), selector, minutes: z.number().int().min(-1440).max(1440) }),
   z.strictObject({ op: z.literal('repeat'), recurrence }),
   z.strictObject({ op: z.literal('replace'), rule: ruleSchema }),
+  z.strictObject({ op: z.literal('only'), when: dateSpec }),
   z.strictObject({ op: z.literal('set_clock'), time: timeSchema, except: z.array(dateSpec).min(1).max(8).optional() }),
+  z.strictObject({ op: z.literal('period_clock') }),
   z.strictObject({ op: z.literal('stop') }),
   z.strictObject({ op: z.literal('resume') }),
   z.strictObject({ op: z.literal('undo_remove') }),
+  z.strictObject({ op: z.literal('undo_add') }),
 ])
 
 export type NotificationEdit = z.infer<typeof notificationEditSchema>
 export type NotificationDate = z.infer<typeof dateSpec>
 export type NotificationSlot = NotificationDate & { time: string }
 type Selector = z.infer<typeof selector>
-export type TimeSource = 'explicit' | 'conversation' | 'current' | 'group' | 'default'
-export type NotificationChange = { before?: NotificationSlot; after?: NotificationSlot; timeSource?: TimeSource; summary?: string;
+export type NotificationChange = { before?: NotificationSlot; after?: NotificationSlot; timeSource?: TimeSource; resolvedTime?: string; summary?: string;
   reactivate?: boolean; resumed?: true }
 type Problem = 'time' | 'day' | 'missing' | 'past' | 'limit' | 'conflict'
 type State = { rule: ReminderRule; anchor: number; enabled: boolean }
 type Input = State & { dueDate: string; now: number; focus?: NotificationChange; defaultTime?: string;
-  quotedAt?: number | null; activation?: 'resume' | 'keep' }
+  groupRule?: ReminderRule; quotedAt?: number | null; clockQuote?: number | null; periodFor?: (when?: NotificationDate) => Daypart | undefined;
+  activation?: 'resume' | 'keep' }
 type Result = { ok: true; state: State; changes: NotificationChange[] } |
   { ok: false; reason: Problem; time?: string; destinationTime?: string }
 const day = 86_400_000
-const japanClock = new Intl.DateTimeFormat('ja-JP', { timeZone: 'Asia/Tokyo', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
-
-export function configuredTimes(rule: ReminderRule, dueDate: string, anchor: number) {
-  const base = rule.type === 'default' ? defaultReminderOffsets(dueDate, anchor).map((s) => s.time)
-    : rule.type === 'offsets' ? rule.slots.map((s) => s.time) : [...rule.times, ...(rule.extraSlots ?? []).map((s) => s.time)]
-  return [...new Set([...base, ...absoluteReminders(rule).map((s) => s.time)])].sort()
-}
 
 export function scheduledTime(slot: NotificationSlot, dueDate: string) {
   return slot.kind === 'absolute' ? absoluteTime(slot) : slotTime(jstMidnight(dueDate), slot)
@@ -70,7 +68,7 @@ type Search = Exclude<Selector, { kind: 'recent' }> | { kind: 'quoted'; at: numb
 function occurrences(rule: ReminderRule, input: Input, wanted: Search): Occurrence[] {
   const calendarDay = wanted.kind === 'time' ? undefined : wanted.kind === 'quoted'
     ? jstMidnight(todayInJapan(wanted.at)) : selectedDay(wanted, input.dueDate)
-  const wantedTime = wanted.kind === 'quoted' ? japanClock.format(wanted.at) : wanted.time
+  const wantedTime = wanted.kind === 'quoted' ? notificationClockAt(wanted.at) : wanted.time
   const relativeSlots = rule.type === 'default' ? defaultReminderOffsets(input.dueDate, input.anchor)
     : rule.type === 'offsets' ? rule.slots : rule.extraSlots ?? []
   const candidates: NotificationSlot[] = [
@@ -85,7 +83,7 @@ function occurrences(rule: ReminderRule, input: Input, wanted: Search): Occurren
       for (const at of reminderSlots(series, input.dueDate, input.anchor, after, calendarDay === undefined ? 2 + candidates.length : times.length)) {
         if (calendarDay !== undefined && at >= calendarDay + day) break
         const daysBefore = (jstMidnight(input.dueDate) - jstMidnight(todayInJapan(at))) / day
-        candidates.push({ kind: 'relative', daysBefore, time: japanClock.format(at) })
+        candidates.push({ kind: 'relative', daysBefore, time: notificationClockAt(at) })
       }
     }
   }
@@ -135,14 +133,10 @@ function addSlot(rule: ReminderRule, slot: NotificationSlot, input: Input): Remi
   return result.kind === 'changed' ? result.rule : result.kind === 'duplicate' ? rule : undefined
 }
 
-function pickTime(rule: ReminderRule, input: Input, explicit?: string): { time: string; timeSource: TimeSource } | undefined {
-  if (explicit) return { time: explicit, timeSource: 'explicit' }
+function pickTime(rule: ReminderRule, input: Input, explicit?: string, destination?: NotificationDate, original?: string) {
   const focused = input.focus?.after
-  if (focused && occurrences(rule, input, focused).length === 1) return { time: focused.time, timeSource: 'conversation' }
-  const times = configuredTimes(rule, input.dueDate, input.anchor)
-  if (times.length > 1) return
-  if (times.length === 1) return { time: times[0], timeSource: 'current' }
-  return input.defaultTime ? { time: input.defaultTime, timeSource: 'group' } : { time: '20:00', timeSource: 'default' }
+  return resolveNotificationClock({ ...input, rule, explicit, original, quotedAt: input.clockQuote ?? input.quotedAt,
+    period: input.periodFor?.(destination), focused: focused && occurrences(rule, input, focused).length === 1 ? focused.time : undefined })
 }
 
 export function applyNotificationPlan(input: Input, edits: NotificationEdit[]): Result {
@@ -150,7 +144,7 @@ export function applyNotificationPlan(input: Input, edits: NotificationEdit[]): 
   const changes: NotificationChange[] = []
   const reject = (reason: Problem, time?: string, destinationTime?: string): Result => ({ ok: false, reason, time, destinationTime })
   const resumes = input.activation === 'resume' && edits.some(({ op }) => op === 'add' || op === 'add_clock' ||
-    op === 'set_clock' || op === 'move' || op === 'shift' || op === 'repeat' || op === 'replace')
+    op === 'set_clock' || op === 'period_clock' || op === 'move' || op === 'shift' || op === 'repeat' || op === 'replace' || op === 'only')
   if (resumes) enabled = true
   for (const edit of edits) {
     const current = { ...input, anchor }
@@ -172,6 +166,22 @@ export function applyNotificationPlan(input: Input, edits: NotificationEdit[]): 
       if (relative.kind === 'changed') rule = relative.rule
       if (added.length) rule = withAbsolute(rule, [...slots, ...added], current)
       if (relative.kind === 'changed' || added.length) changes.push({ summary: `通知日に${edit.time}を追加`, timeSource: 'explicit' })
+      continue
+    }
+    if (edit.op === 'only') {
+      const picked = pickTime(rule, current, edit.when.time, edit.when)
+      const slot = { ...edit.when, time: picked.time }
+      if (scheduledTime(slot, input.dueDate) <= input.now) return reject('past')
+      rule = slot.kind === 'relative' ? { type: 'offsets', slots: [{ daysBefore: slot.daysBefore, time: slot.time }] }
+        : { type: 'offsets', slots: [], absoluteSlots: [{ date: slot.date, time: slot.time }] }
+      anchor = input.now
+      changes.push({ timeSource: picked.timeSource, resolvedTime: picked.time, summary: '通知ルールを置き換え' })
+      continue
+    }
+    if (edit.op === 'period_clock') {
+      const picked = pickTime(rule, current)
+      rule = changeReminderTime(rule, picked.time, input.dueDate, anchor)
+      changes.push({ timeSource: picked.timeSource, resolvedTime: picked.time, summary: `すべての通知を${picked.time}に変更しました。` })
       continue
     }
     if (edit.op === 'replace' || edit.op === 'set_clock' || edit.op === 'repeat') {
@@ -209,7 +219,6 @@ export function applyNotificationPlan(input: Input, edits: NotificationEdit[]): 
       } else {
         const { time, ...period } = edit.recurrence
         const picked = pickTime(rule, current, time)
-        if (!picked) return reject('time')
         const extraSlots = rule.type === 'default' ? defaultReminderOffsets(input.dueDate, anchor)
           : rule.type === 'offsets' ? rule.slots : rule.extraSlots
         const next = { type: 'repeat' as const, ...period, times: [picked.time], extraSlots,
@@ -222,21 +231,46 @@ export function applyNotificationPlan(input: Input, edits: NotificationEdit[]): 
         }
         rule = next
         anchor = input.now
-        changes.push({ summary: '繰り返しを追加', timeSource: picked.timeSource })
+        changes.push({ summary: '繰り返しを追加', timeSource: picked.timeSource, resolvedTime: picked.time })
       }
       continue
     }
 
     let before: NotificationSlot | undefined
     let source: Occurrence | undefined
+    if (edit.op === 'undo_add') {
+      const added = input.focus?.after
+      if (!added || input.focus?.before || input.focus?.summary) return reject('missing')
+      const match = occurrences(rule, current, added)[0]
+      if (!match) return reject('missing')
+      const next = removeSlot(rule, added, current)
+      if (!next) return reject('limit')
+      rule = next
+      changes.push({ before: added })
+      continue
+    }
     if (edit.op !== 'add' && edit.op !== 'undo_remove') {
+      const upcoming = edit.selector.kind === 'recent' && (edit.op === 'move' || edit.op === 'shift') &&
+        input.quotedAt === undefined && !input.focus?.after
+        ? reminderSlots(rule, input.dueDate, anchor, input.now, 2) : []
       const wanted: Search | undefined = edit.selector.kind !== 'recent' ? edit.selector
-        : input.quotedAt === undefined ? input.focus?.after : input.quotedAt === null ? undefined : { kind: 'quoted', at: input.quotedAt }
+        : input.quotedAt === undefined ? input.focus?.after ?? (upcoming.length === 1 ? { kind: 'quoted', at: upcoming[0] } : undefined)
+          : input.quotedAt === null ? undefined : { kind: 'quoted', at: input.quotedAt }
       const matches = (wanted ? occurrences(rule, current, wanted) : []).filter((item) =>
         edit.selector.kind !== 'recent' || !edit.selector.time || item.slots[0].time === edit.selector.time)
       const destinationTime = edit.op === 'move' && edit.to.kind === 'time' ? edit.to.time : undefined
       const sourceClock = edit.selector.kind === 'recent' ? edit.selector.time : wanted && 'time' in wanted ? wanted.time : undefined
+      if (!wanted && upcoming.length > 1) return reject('day', sourceClock, destinationTime)
       if (!matches.length) return reject('missing', sourceClock, destinationTime)
+      if (edit.op === 'remove' && (edit.selector.kind === 'absolute' || edit.selector.kind === 'relative') && !edit.selector.time) {
+        for (const match of matches) {
+          const next = withoutOccurrence(rule, match, current)
+          if (!next) return reject('limit')
+          rule = next
+          changes.push({ before: match.slots[0] })
+        }
+        continue
+      }
       if (matches.length > 1) {
         const focused = input.focus?.after
         if (focused && wanted?.kind === 'time' && focused.time === wanted.time) {
@@ -249,7 +283,7 @@ export function applyNotificationPlan(input: Input, edits: NotificationEdit[]): 
 
     let destination: NotificationDate | undefined
     if (edit.op === 'add') destination = edit.when
-    if (edit.op === 'move' && before) destination = edit.to.kind === 'time' ? { ...before, time: edit.to.time } : { ...edit.to, time: edit.to.time ?? before.time }
+    if (edit.op === 'move' && before) destination = edit.to.kind === 'time' ? { ...before, time: edit.to.time } : edit.to
     if (edit.op === 'undo_remove') {
       destination = input.focus?.after ? undefined : input.focus?.before
       if (!destination) return reject('missing')
@@ -257,20 +291,17 @@ export function applyNotificationPlan(input: Input, edits: NotificationEdit[]): 
     if (edit.op === 'shift' && before) {
       const at = scheduledTime(before, input.dueDate) + edit.minutes * 60_000
       const date = todayInJapan(at)
-      const time = japanClock.format(at)
+      const time = notificationClockAt(at)
       const daysBefore = (jstMidnight(input.dueDate) - jstMidnight(date)) / day
       if (before.kind === 'relative' && (daysBefore < 0 || daysBefore > 366)) return reject('conflict')
       destination = before.kind === 'absolute' ? { kind: 'absolute', date, time } : { kind: 'relative', daysBefore, time }
     }
 
-    const picked = edit.op === 'move' && !edit.to.time && before
-      ? { time: before.time, timeSource: edit.selector.kind === 'recent' ? 'conversation' as const : 'current' as const }
-      : edit.op === 'undo_remove' && destination?.time ? { time: destination.time, timeSource: 'conversation' as const }
-        : destination ? pickTime(rule, current, destination.time) : undefined
-    if (destination && !picked) return reject('time')
+    const picked = edit.op === 'undo_remove' && destination?.time ? { time: destination.time, timeSource: 'conversation' as const }
+      : destination ? pickTime(rule, current, destination.time, destination, edit.op === 'move' ? before?.time : undefined) : undefined
     const after = destination && picked ? { ...destination, time: picked.time } : undefined
     if (after && source && scheduledTime(after, input.dueDate) === source.at) continue
-    if (after && (after.kind === 'absolute' || source !== undefined) && scheduledTime(after, input.dueDate) <= input.now) return reject('past')
+    if (after && scheduledTime(after, input.dueDate) <= input.now) return reject('past')
     const duplicate = after ? occurrences(rule, current, after).length > 0 : false
     if (!before && duplicate) {
       if (edit.op === 'undo_remove' && input.focus?.reactivate && !enabled && input.activation !== 'keep') {

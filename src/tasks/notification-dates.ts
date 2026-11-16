@@ -2,13 +2,13 @@ import type { TaskAction } from './intent'
 import type { NotificationDate, NotificationEdit } from './notification-plan'
 import { jstMidnight } from './schedule'
 import { todayInJapan } from './validation'
+import type { Daypart } from './notification-clock'
 
 const day = 86_400_000
 const weekdays = '日月火水木金土'
-const clockPattern = /(?:(午前|午後|朝|夜)\s*)?(\d{1,2})(?::(\d{2})|時(?:\s*(\d{1,2})分|(半))?)|朝(?=の通知|にも)|夜(?=の通知|にも)/g
+const clockPattern = /(?:(午前|午後|朝|夜)\s*)?(\d{1,2})(?::(\d{2})|時(?:\s*(\d{1,2})分|(半))?)/g
 function clocks(text: string) {
   return [...text.matchAll(clockPattern)].map((match) => {
-    if (!match[2]) return { time: match[0] === '朝' ? '08:00' : '20:00', index: match.index, end: match.index + match[0].length }
     const period = match[1]
     let hour = Number(match[2])
     const minute = match[5] ? 30 : Number(match[3] ?? match[4] ?? 0)
@@ -20,7 +20,7 @@ function clocks(text: string) {
 }
 
 const numericDate = /(?<!\d)(?:(\d{4})(?:年|[-/]))?(\d{1,2})(?:月|[-/])(\d{1,2})(?!\d)(?:日)?/g
-const spokenDate = /(明後日|あさって|明日|あした|今日|きょう)|(?:(来週|今週|再来週)\s*(?:の\s*)?)?([日月火水木金土])曜(?:日)?/g
+const spokenDate = /(明後日|あさって|明日|あした|今日|きょう|今朝|今夜)|(?:(来週|今週|再来週)\s*(?:の\s*)?)?([日月火水木金土])曜(?:日)?/g
 const relativeDate = /(?:(\d{1,3}|[一二三四五六七八九十百]{1,5})(日|週間)前)|(締切当日|当日|前日)/g
 export function relativeDays(text: string) {
   return [...text.matchAll(relativeDate)].map((match) => {
@@ -73,8 +73,75 @@ export function explicitNotificationDates(text: string, now: number) {
 }
 
 export function explicitNotificationTimes(text: string) {
-  const normalized = text.normalize('NFKC')
-  return clocks(normalized).filter(({ index, end }) => /\d/.test(normalized.slice(index, end))).map(({ time }) => time)
+  return clocks(text.normalize('NFKC')).map(({ time }) => time)
+}
+
+export function notificationPeriod(text: string, now: number, when?: NotificationDate): Daypart | undefined {
+  const parts = text.normalize('NFKC').split(/[、,。\n]/).map((clause) => {
+    const match = /(今朝|今夜|朝|夕方|夜)(?=に|にも|で|の通知|通知して|知らせて|ごろ|頃|$)/.exec(clause.trim())
+    return { clause, period: !match ? undefined : /朝/.test(match[1]) ? 'morning' as const
+      : match[1] === '夕方' ? 'evening' as const : 'night' as const }
+  })
+  const sameDay = when && parts.filter(({ clause }) => when.kind === 'relative'
+    ? relativeDays(clause).includes(when.daysBefore) : explicitNotificationDates(clause, now).some(({ date }) => date === when.date))
+  const exact = sameDay?.filter(({ period }) => period).at(-1)?.period
+  if (exact) return exact
+  return parts.filter(({ clause }) => !when || !relativeDays(clause).length && !explicitNotificationDates(clause, now).length)
+    .filter(({ period }) => period).at(-1)?.period
+}
+
+export const removalWords = /消(?:し|して)|削除|いらない|外(?:し|して)|省(?:い|いて)|なくして|なし(?:で|に)|取り除/
+export const keepNoticeWords = /消さない|外さない|省かない|削除しない|残して|そのまま/
+const replacementWords = /だけ|のみ|置き換|入れ替え|リセット|今の設定をやめ/
+export const clockReasonRequest = /(?:なんで|なぜ|どうして).*(?:時|通知)|(?:通知|時刻|時間).*(?:理由|どう決め)/
+export const undoAdditionRequest = /^(?:やっぱり?\s*)?(?:今|さっき|直前)の(?:追加|通知を追加)(?:は|を)?(?:なし(?:で)?|取消して|取り消して|やめて)$/
+
+export function simpleNotificationEdit(text: string, now: number): NotificationEdit | undefined {
+  // Use the date and operation stated in one clause. Compound requests still require the whole plan.
+  const value = text.normalize('NFKC').trim().replace(/[。！!]+$/, '')
+  if (/[、。\n]|(?:(?:手順|例|場合)として)|(?:と言ったら|と仮定)/.test(value)) return
+  if (undoAdditionRequest.test(value)) return { op: 'undo_add' }
+  if (/^通知(?:は|を)(?:外して|なくして|やめて|なしで)$/.test(value)) return { op: 'stop' }
+  const absolute = explicitNotificationDates(value, now)
+  const relative = relativeDays(value)
+  const times = explicitNotificationTimes(value)
+  if (absolute.some(({ date }) => !date) || times.some((time) => !time) || relative.some((day) => day > 366)) return
+  const when: NotificationDate | undefined = times.length <= 1 && absolute.length === 1 && !relative.length
+    ? { kind: 'absolute', date: absolute[0].date!, time: absolute[0].time ?? (times.length === 1 ? times[0] : undefined) }
+    : times.length <= 1 && relative.length === 1 && !absolute.length
+      ? { kind: 'relative', daysBefore: relative[0], time: times[0] } : undefined
+  if (removalWords.test(value) && !keepNoticeWords.test(value) && !/変更|変え|移し|以外|を除い/.test(value) &&
+    (/通知/.test(value) || relative.length > 0 && !/タスク|期限|締切/.test(value))) {
+    if (when) return { op: 'remove', selector: when }
+    if (refersToIndividualNotification(value) && !absolute.length && !relative.length && times.length <= 1) {
+      return { op: 'remove', selector: { kind: 'recent', time: times.length === 1 ? times[0] : undefined } }
+    }
+  }
+  const clock = (!when || /(?:の通知|だけ).*(?:時|:\d{2})/.test(value) ||
+    /(?:時|:\d{2})(?:に|へ)(?:変更|変え)/.test(value)) ? clockChange(value, now) : undefined
+  if (clock) return clock
+  if (when && replacementWords.test(value) && !/この通知|その通知|を(?:消|外)|以外|変え|変更|移し|通知だけ.*(?:時|:\d{2})/.test(value) &&
+    /(?:通知|だけ(?:にして|でいい(?:や|よ)?|でお願い)?$|のみ(?:にして)?$)/.test(value)) return { op: 'only', when }
+  if (when && /(?:日|朝|夕方|夜)(?:の\d{1,2}時)?\s*(?:に|へ)\s*(?:変更|変え|移し)/.test(value) && !/だけ|削除|消して|追加/.test(value)) {
+    return { op: 'move', selector: { kind: 'recent' }, to: when }
+  }
+  if (absolute.length === 1 && relative.length === 1 && /(?:変更|変え|移し)/.test(value) && !/消し|削除|外し|追加/.test(value)) {
+    const [source] = relativeClockEvidence(value)
+    const [date] = absolute
+    const relativeIndex = [...value.matchAll(relativeDate)][0].index
+    if (relativeIndex < date.index) return { op: 'move', selector: { kind: 'relative', daysBefore: relative[0], time: source?.time },
+      to: { kind: 'absolute', date: date.date!, time: date.time } }
+  }
+  if (when && /(?:通知(?:も|を)?(?:して|追加)|知らせて|追加して|増やして|教えて)$/.test(value) && !/毎|おき|曜日ごと|変更|変え|移し|削除|省い|外し|いらない|やめ|じゃなく|ではなく/.test(value)) {
+    return { op: 'add', when }
+  }
+  if (!absolute.length && !relative.length && !times.length) {
+    if (!allClock.test(value) && /(?:少し|ちょっと)早(?:め|く)に?(?:して|通知して)$/.test(value)) {
+      return { op: 'shift', selector: { kind: 'recent' }, minutes: -30 }
+    }
+    if (notificationPeriod(value, now) && /(?:朝|夜|夕方)(?:に通知して|にして|でいい)$/.test(value)) return { op: 'period_clock' }
+    if (/^(?:通知(?:を|は)?して|(?:.+?(?:の|は|を))通知して|いつもの時間で通知して)$/.test(value) && !/忘れない|毎|時刻/.test(value)) return { op: 'resume' }
+  }
 }
 
 function preciseDate(text: string, now: number): NotificationDate | undefined {
@@ -140,7 +207,9 @@ function clockChange(text: string, now: number): Extract<NotificationEdit, { op:
   if (!values.length || values.length > 2 || values.some((value) => !value.time)) return
   const last = values.at(-1)!
   const time = last.time!
-  if (!/^(?:に(?:通知して|して|変更して|変えて)|で(?:お願い(?:します)?)?|がいい(?:です)?)$/.test(text.slice(last.end).trim())) return
+  const ending = text.slice(last.end).trim()
+  if (!/^(?:に(?:通知して|して|変更して|変えて)|で(?:お願い(?:します)?)?|がいい(?:です)?)$/.test(ending) &&
+    !(ending === 'に' && (allClock.test(text) || refersToIndividualNotification(text)))) return
   const previous = values.length === 2 ? values[0] : undefined
   const hasCorrection = previous && clockCorrection.test(text.slice(previous.end, last.index).trim())
   const before = text.slice(0, last.index).trim()
@@ -245,7 +314,7 @@ export function literalNotificationEdits(text: string, now: number): Notificatio
 function dateOperands(edit: NotificationEdit): NotificationDate[] {
   const result: NotificationDate[] = []
   if ('selector' in edit && (edit.selector.kind === 'absolute' || edit.selector.kind === 'relative')) result.push(edit.selector)
-  if (edit.op === 'add') result.push(edit.when)
+  if (edit.op === 'add' || edit.op === 'only') result.push(edit.when)
   if (edit.op === 'move' && edit.to.kind !== 'time') result.push(edit.to)
   if (edit.op === 'replace' && edit.rule.type !== 'default') {
     result.push(...(edit.rule.absoluteSlots ?? []).map((slot) => ({ kind: 'absolute' as const, ...slot })))
@@ -257,7 +326,17 @@ function dateOperands(edit: NotificationEdit): NotificationDate[] {
 export function validateNotificationIntent(action: TaskAction, text: string, now: number, correctRecentNotice = false): TaskAction {
   const reminderOperation = action.type === 'edit_notifications' || action.type === 'modify_reminder' ||
     action.type === 'set_reminder' || action.type === 'disable_reminder' || action.type === 'enable_reminder'
-  const normalized = text.normalize('NFKC')
+  let normalized = text.normalize('NFKC')
+  if (reminderOperation && 'target' in action && action.target.by === 'name' && action.target.dueDate) {
+    const dueDate = action.target.dueDate
+    for (const date of explicitNotificationDates(normalized, now).filter((entry) => entry.date === dueDate && !entry.time).reverse()) {
+      const before = normalized.slice(0, date.index)
+      const after = normalized.slice(date.end)
+      const prefix = /(?:期限|締切)(?:が|は|の)\s*$/.exec(before)
+      const suffix = /^(?:の|が)\s*(?:期限|締切)(?:の)?/.exec(after)
+      if (prefix || suffix) normalized = (prefix ? before.slice(0, prefix.index) : before) + (suffix ? after.slice(suffix[0].length) : after)
+    }
+  }
   const parts = normalized.split(/[、。\n]/)
   const unchangedClauses = parts.flatMap((part) => /^(.+?)(?:そのままで?|のまま(?:にして)?|残して)/.exec(part)?.[1] ?? []).join('、')
   const changedClauses = parts.map((part) => part.replace(/^.*?(?:そのままで?|のまま(?:にして)?|残して)/, '')).join('、')
@@ -265,10 +344,16 @@ export function validateNotificationIntent(action: TaskAction, text: string, now
   if (action.type === 'create_task' && dates.length && /(?:にも|も追加).*(?:通知|知らせ|教え)|(?:通知|知らせ).*(?:じゃなく|ではなく)/.test(normalized)
     && !/タスクを登録|登録して|追加で登録/.test(normalized)) return { type: 'clarify', question: 'task' }
   if (!reminderOperation) return action
+  if (/以外|を除い/.test(normalized) && removalWords.test(normalized) &&
+    (action.type === 'disable_reminder' || action.type === 'edit_notifications' &&
+      action.edits.some((edit) => edit.op === 'remove' || edit.op === 'stop'))) return { type: 'clarify', question: 'day' }
   if (/(?:通知設定|通知の設定)(?:を|が|は)?(?:確認したい|確認して|教えて)[。？?！!]*$/.test(normalized.trim()) && 'target' in action) {
     return { type: 'get_reminder', target: action.target }
   }
   if ('target' in action && !correctRecentNotice) {
+    const simple = simpleNotificationEdit(normalized, now)
+    const legacy = action.type === 'modify_reminder' && action.edit.mode === 'remove' && simple?.op === 'remove'
+    if (simple && !legacy) return { type: 'edit_notifications', target: action.target, edits: [simple] }
     const literal = literalNotificationEdits(normalized, now)
     if (literal?.length === 1 && (literal[0].op === 'set_clock' || literal[0].op === 'move' && literal[0].to.kind === 'time')) {
       return { type: 'edit_notifications', target: action.target, edits: literal }
@@ -321,7 +406,7 @@ export function validateNotificationIntent(action: TaskAction, text: string, now
       !keepAbsolute.some((date) => date.date === when.date && (!date.time || date.time === when.time))
     return changedRelative.includes(when.daysBefore) || !keepRelative.includes(when.daysBefore)
   }).map((edit): NotificationEdit => {
-    if (!times.length && edit.op === 'add') return { ...edit, when: { ...edit.when, time: undefined } }
+    if (!times.length && (edit.op === 'add' || edit.op === 'only')) return { ...edit, when: { ...edit.when, time: undefined } }
     if (!times.length && edit.op === 'repeat') return { ...edit, recurrence: { ...edit.recurrence, time: undefined } }
     if (edit.op === 'remove' && (edit.selector.kind === 'relative' || edit.selector.kind === 'absolute') && noStatedClock(edit.selector)) {
       return { ...edit, selector: { ...edit.selector, time: undefined } }
@@ -334,7 +419,7 @@ export function validateNotificationIntent(action: TaskAction, text: string, now
       if (edit.to.kind === 'time' && referredNotice && !wholeClock) return { ...edit, selector: referredSource }
       return { ...edit, selector: (source.kind === 'relative' || source.kind === 'absolute') && noStatedClock(source)
         ? { ...source, time: undefined } : source,
-        to: !times.length && edit.to.kind !== 'time' ? { ...edit.to, time: undefined } : edit.to }
+        to: edit.to.kind !== 'time' && !times.some((clock) => clock.time === edit.to.time) ? { ...edit.to, time: undefined } : edit.to }
     }
     if (edit.op === 'set_clock') {
       if (!wholeClock && referredNotice && times.at(-1)?.time === edit.time) {
@@ -355,6 +440,8 @@ export function validateNotificationIntent(action: TaskAction, text: string, now
   if (edits.some((edit) => edit.op === 'shift' && (!minutes || edit.minutes !== minutes))) {
     return { type: 'clarify', question: 'time' }
   }
+  if (edits.some((edit) => edit.op === 'undo_add') && !undoAdditionRequest.test(normalized) ||
+    edits.some((edit) => edit.op === 'period_clock') && !notificationPeriod(normalized, now)) return { type: 'clarify', question: 'mode' }
   if (edits.some((edit) => edit.op === 'resume') && !explicitlyResumes.test(normalized) && !notificationActivation(normalized)) {
     return { type: 'clarify', question: 'mode' }
   }
@@ -369,7 +456,7 @@ export function validateNotificationIntent(action: TaskAction, text: string, now
   }
   if (edits.some((edit) => edit.op === 'set_clock' && (!wholeClock ||
     /(?:そのまま|のまま|残して)/.test(normalized) && !edit.except?.length))) return { type: 'clarify', question: 'day' }
-  if (edits.some((edit) => edit.op === 'replace' &&
+  if (edits.some((edit) => (edit.op === 'replace' || edit.op === 'only') &&
     !/(?:だけ|のみ)(?:でいい|にして|に変え|に変更|通知して|[。！!]*$)|リセット|全部変更|すべて変更|置き換え/.test(normalized))) {
     return { type: 'clarify', question: 'mode' }
   }
@@ -408,12 +495,12 @@ export function validateNotificationIntent(action: TaskAction, text: string, now
 
   if (!edits.some((edit) => edit.op === 'replace')) {
     const removals = edits.flatMap((edit) => edit.op === 'remove' || edit.op === 'move' ? [edit.selector] : [])
-    const additions = edits.flatMap((edit) => edit.op === 'add' ? [edit.when] : edit.op === 'move' ? [edit.to] : [])
+    const additions = edits.flatMap((edit) => edit.op === 'add' || edit.op === 'only' ? [edit.when] : edit.op === 'move' ? [edit.to] : [])
     for (const clause of clauses) {
       if (/毎週|毎日|日おき|曜日ごと/.test(clause) && edits.some((edit) => edit.op === 'repeat')) continue
-      const operation = /消し|削除|いらない|なくし|じゃなく|ではなく/.test(clause) ? removals
-        : /追加|(?:に)?も(?:通知|教え|知らせ)|通知して/.test(clause) && !/変更|変え|を.*に/.test(clause) ? additions : undefined
-      if (!operation || /消さない/.test(clause)) continue
+      const operation = removalWords.test(clause) || /じゃなく|ではなく/.test(clause) ? removals
+        : /追加|増や|(?:に)?も(?:通知|教え|知らせ)|通知して/.test(clause) && !/変更|変え|を.*に/.test(clause) ? additions : undefined
+      if (!operation || keepNoticeWords.test(clause)) continue
       if (relativeDays(clause).some((days) => !operation.some((when) => when.kind === 'relative' && when.daysBefore === days)) ||
         explicitNotificationDates(clause, now).some((date) =>
           !operation.some((when) => when.kind === 'absolute' && when.date === date.date))) return { type: 'clarify', question: 'day' }

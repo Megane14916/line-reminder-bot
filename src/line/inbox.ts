@@ -1,14 +1,14 @@
 import { intentSchema, type TaskAction } from '../tasks/intent'
 import { answerSelection, dispatchAction } from '../tasks/actions'
-import { askClarification, followupQuestions, holdDialogue } from '../tasks/clarification'
-import { applyEvent, findTasks, finishInboxEvent, getBotMessage, getContext, getTask, mentionedTask, pendingContext, saveContext, sentMessage, wasProcessed,
+import { askClarification, delegatesClock, followupQuestions, holdDialogue } from '../tasks/clarification'
+import { applyEvent, findTasks, finishInboxEvent, getBotMessage, getContext, getTask, groupReminderRule, mentionedTask, pendingContext, saveContext, sentMessage, wasProcessed,
   type TaskEvent } from '../tasks/repository'
 import { conversationHistory, notificationFocus } from '../tasks/conversation'
 import { getDialogue, type Dialogue } from '../tasks/dialogue'
 import { continuationFields, dateTimeEvidence, groundedTitle, groundTemporalDraft, hasDifferentQuotedSubject, reconcileDraft,
   resolveDraft, validateCreation } from '../tasks/draft'
-import { withoutVagueClock } from '../tasks/draft-edits'
-import { explicitNotificationDates, explicitNotificationTimes, literalNotificationEdits, notificationDateQuery, validateNotificationIntent } from '../tasks/notification-dates'
+import { clockReasonRequest, explicitNotificationDates, explicitNotificationTimes, literalNotificationEdits, notificationDateQuery,
+  notificationPeriod, refersToQuotedNotification, simpleNotificationEdit, undoAdditionRequest, validateNotificationIntent } from '../tasks/notification-dates'
 import { reminderSlots, ruleSchema } from '../tasks/schedule'
 import { cleanTargetReference, namesTarget } from '../tasks/target-matching'
 import { aiTimeout, runtimeBudget, type RuntimeBudget } from '../runtime-budget'
@@ -175,20 +175,32 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
       }
       event.text = text
       event.quoteTaskId = quote?.task_id ?? legacy?.quoteTaskId
+      event.quotedTurn = quote?.turn_json ? JSON.parse(quote.turn_json) : undefined
       if (quote && quote.task_id === null && !stored?.taskId) event.quoteTaskId = null
       event.quotedAt = quote?.scheduled_at ?? pending?.quotedAt ?? (quote ? null : undefined)
       const contextualId = event.quoteTaskId === undefined ? stored?.taskId ?? context?.task_id : event.quoteTaskId
       const [history, named] = await Promise.all([conversationHistory(db, event),
         quote || stored?.pending ? undefined : mentionedTask(db, event.groupId, text)])
       event.history = history
+      event.explicitTaskId = named?.id
       const contextualTask = named ?? (contextualId ? await getTask(db, event.groupId, contextualId) : null)
       if (contextualTask) event.observedTask = { id: contextualTask.id, version: contextualTask.reminder_version }
       const dialogueVersion = pending?.observedTask
       const quick = quote?.task_id && !pending ? quickQuotedIntent(text) : undefined
-      const focus = contextualTask && (stored?.taskId === contextualTask.id && stored.focus?.version === contextualTask.reminder_version
-        ? stored.focus : notificationFocus(history, contextualTask.id, contextualTask.reminder_version))
+      const quotedChange = event.quotedTurn?.changes?.length === 1 ? event.quotedTurn.changes[0] : undefined
+      const focus = contextualTask && (quotedChange?.after
+        ? event.quotedTurn?.version === contextualTask.reminder_version ? quotedChange : undefined
+        : stored?.taskId === contextualTask.id && stored.focus?.version === contextualTask.reminder_version
+          ? stored.focus : notificationFocus(history, contextualTask.id, contextualTask.reminder_version))
+      const correction = /^(?:やっぱり?|いや[、,]?)\s*(?:朝|夜|午前|午後)?\s*\d{1,2}(?::\d{2}|時(?:半|\d{1,2}分)?)(?:で(?:いい)?|にして)?[。！!]*$/.test(text.normalize('NFKC'))
       const correctRecentNotice = Boolean(focus && !focus.before && focus.after &&
-        /^(?:やっぱり?|いや[、,]?)\s*(?:朝|夜|午前|午後)?\s*\d{1,2}(?::\d{2}|時(?:半|\d{1,2}分)?)(?:で(?:いい)?|にして)?[。！!]*$/.test(text.normalize('NFKC')))
+        correction)
+      if (quotedChange?.after && contextualTask && event.quotedTurn?.version !== contextualTask.reminder_version &&
+        (correction || refersToQuotedNotification(text) || undoAdditionRequest.test(text.trim().replace(/[。！!]+$/, '')))) {
+        await finishInboxEvent(db, { ...event, now: clock() }, false,
+          '🔔 引用した通知から設定が変わっています。最新の通知を確認して、もう一度送ってください。')
+        return
+      }
       if (quick && quote?.task_id) {
         action = { ...quick, target: { by: 'id', id: quote.task_id } }
       } else if (row.action_json) {
@@ -203,11 +215,24 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
             event.quotedAt = saved.reference.at
           }
           event.pendingPlan = saved.pendingPlan
+          event.explicitTaskId = saved.explicitTaskId
+          event.delegatedPeriod = saved.delegatedPeriod
+          event.turn = saved.turn
         }
         action = intentSchema.parse(saved.action ?? saved)
       } else if (!pending && notificationDateQuery(text, event.eventTime, false)) {
         action = { type: 'get_reminder', target: contextualTask ? { by: 'id', id: contextualTask.id } : { by: 'recent' } }
+      } else if (!pending && clockReasonRequest.test(text)) {
+        action = { type: 'get_reminder_reason', target: { by: 'recent' } }
       } else {
+        if (!pending && /通知|知らせ/.test(text)) {
+          const validity = dateTimeEvidence(text, event.eventTime)
+          if (validity.invalidDay || validity.invalidTime) {
+            reply = validity.invalidDay ? '📅 指定した日付は存在しません。' : '🔔 指定した時刻は無効です。'
+            await finishInboxEvent(db, { ...event, now: clock() }, false, reply, 'invalid_intent')
+            return
+          }
+        }
         const rule = contextualTask ? ruleSchema.parse(JSON.parse(contextualTask.reminder_rule)) : undefined
         const timeout = Math.min(aiTimeout(env), budget.remaining() - 3000)
         if (timeout <= 0) return
@@ -228,7 +253,10 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
           await retryEvent(db, row, event, clock(), 'ai_' + parsed.kind, failedInference)
           return
         }
-        const dialogue = parsed.kind === 'dialogue' ? parsed.proposal : parsed.kind === 'parsed'
+        const delegated = pending?.question === 'time' && pending.draft && delegatesClock(text)
+        if (delegated) event.delegatedPeriod = notificationPeriod(text, event.eventTime)
+        const dialogue = delegated ? { type: 'continue' as const, fields: {} }
+          : parsed.kind === 'dialogue' ? parsed.proposal : parsed.kind === 'parsed'
           ? groundTemporalDraft(parsed.action, text, event.eventTime, pending) : undefined
         const registrationTitle = dialogue?.type === 'draft' && dialogue.operation === 'create_task' ? dialogue.fields.title
           : parsed.kind === 'parsed' && parsed.action.type === 'create_task' ? parsed.action.title : undefined
@@ -267,7 +295,8 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
         if (resumeDraft || dialogue?.type === 'draft') {
           const update = dialogue?.type === 'continue' || dialogue?.type === 'draft' && dialogue.operation === resumeDraft?.draft.operation
             ? dialogue : !dialogue && parsed.kind === 'parsed' && resumeDraft ? continuationFields(parsed.action, resumeDraft.draft) : undefined
-          let resumed = resumeDraft && update ? reconcileDraft(resumeDraft, update, original ?? text, text, event.eventTime) : undefined
+          let resumed = resumeDraft && delegated ? { draft: resumeDraft.draft, pending: resumeDraft }
+            : resumeDraft && update ? reconcileDraft(resumeDraft, update, original ?? text, text, event.eventTime) : undefined
           if (!resumed && resumeDraft?.draft.operation === 'edit_notifications' &&
             (parsed.kind === 'invalid' || parsed.kind === 'parsed' && parsed.action.type === 'edit_notifications')) {
             resumed = reconcileDraft(resumeDraft, { fields: {} }, original ?? text, text, event.eventTime, true)
@@ -284,7 +313,7 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
           if (!resumed && draft.operation === 'create_task') startRegistrationThread()
           const target = draft.fields.target
           if (!resumed && draft.operation === 'edit_notifications' && target?.by === 'name' && namesTarget(text, target.name)) {
-            const matches = await findTasks(db, event.groupId, target.name, target.dueDate, false)
+            const matches = await findTasks(db, event.groupId, target.name, target.dueDate, false, target)
             const namedTask = matches?.length === 1 ? matches[0] : undefined
             if (namedTask && (!quote?.task_id || quote.task_id === namedTask.id)) {
               event.thread.taskId = namedTask.id
@@ -294,7 +323,14 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
           if (resumed?.pending.observedTask) event.observedTask = resumed.pending.observedTask
           const draftOrigin = resumed ? original ?? text : text
           const originalAt = resumed?.pending.originalAt ?? event.eventTime
-          const draftResult = resolveDraft(draft, draftOrigin, originalAt, text, event.eventTime, resumed?.pending)
+          const draftResult = resolveDraft(draft, draftOrigin, originalAt, text, event.eventTime, resumed?.pending,
+            draft.operation === 'create_task' ? await groupReminderRule(db, event.groupId) : undefined)
+          if ('error' in draftResult) {
+            event.thread.pending = undefined
+            await applyEvent(db, { ...event, now: clock() }, draftResult.error,
+              saveContext(db, event, 'invalid_intent', contextualTask?.id ?? null))
+            return
+          }
           if ('pending' in draftResult) {
             event.now = clock()
             const taskId = draft.operation === 'edit_notifications' ? event.thread.taskId ?? contextualTask?.id : undefined
@@ -302,10 +338,13 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
               observedTask: draft.operation === 'edit_notifications' ? event.observedTask : undefined }, taskId)
             return
           }
-          if (draftResult.action.type === 'create_task') action = draftResult.action
+          if (draftResult.action.type === 'create_task') {
+            action = draftResult.action
+            if (draftResult.change) event.turn = { operation: action.type, changes: [draftResult.change] }
+          }
           else {
             const expected = draftResult.action
-            event.text = withoutVagueClock(resumed?.pending.editText ?? draftOrigin)
+            event.text = resumed?.pending.editText ?? draftOrigin
             action = authorizeIntent(expected, event.text, !!contextualTask, event.eventTime)
             if (action?.type !== 'edit_notifications' || expected.type !== 'edit_notifications' ||
               action.edits.length !== expected.edits.length ||
@@ -343,6 +382,15 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
           action = authorizeIntent(proposal, event.text, !!contextualTask || !!quote || continuing, event.eventTime, correctRecentNotice)
         }
         if ((!action || action.type === 'clarify' || action.type === 'unknown') && !pending && !correctRecentNotice &&
+          !(/登録|締切|期限/.test(text) && !/通知/.test(text))) {
+          const edit = simpleNotificationEdit(text, event.eventTime)
+          if (edit) {
+            const proposal = parsed.kind === 'parsed' && 'target' in parsed.action ? parsed.action.target : undefined
+            const target = proposal?.by === 'name' && namesTarget(text, proposal.name) ? proposal : { by: 'recent' } as const
+            action = { type: 'edit_notifications', target, edits: [edit] }
+          }
+        }
+        if ((!action || action.type === 'clarify' || action.type === 'unknown') && !pending && !correctRecentNotice &&
           (parsed.kind === 'parsed' && 'target' in parsed.action && parsed.action.type.includes('reminder') ||
             parsed.kind === 'parsed' && parsed.action.type === 'edit_notifications' || parsed.kind === 'invalid')) {
           const edits = literalNotificationEdits(text, event.eventTime)
@@ -357,7 +405,9 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
           const saved = await db.prepare(`UPDATE webhook_inbox SET action_json = ? WHERE receipt_id = ?
               AND status = 'running' AND lease_token = ? AND lease_until > ?`)
             .bind(JSON.stringify({ action, observedTask: event.observedTask, thread: event.thread, startsThread: event.startsThread,
-              text: event.text, pendingPlan: event.pendingPlan, reference: { taskId: event.quoteTaskId, at: event.quotedAt } }),
+              text: event.text, pendingPlan: event.pendingPlan, explicitTaskId: event.explicitTaskId, turn: event.turn,
+              delegatedPeriod: event.delegatedPeriod,
+              reference: { taskId: event.quoteTaskId, at: event.quotedAt } }),
               row.receipt_id, event.inbox.leaseToken, clock()).run()
           if (!saved.meta.changes) return
         }
@@ -414,6 +464,9 @@ export function authorizeIntent(action: TaskAction, text: string, contextual = f
   }
   const normalized = text.normalize('NFKC')
   const edit = action.type === 'modify_reminder' || action.type === 'set_reminder' || action.type === 'edit_notifications'
+  if (!correctRecentNotice && edit && now !== undefined && simpleNotificationEdit(normalized, now)) {
+    return validateNotificationIntent(action, text, now)
+  }
   if (edit && /早め|遅め|もっと早|もっと遅/.test(normalized) && !/\d+(?:時|:\d{2}|日|週間)|前日|当日|朝|夜/.test(normalized)) {
     return { type: 'clarify', question: 'time' }
   }

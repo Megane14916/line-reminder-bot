@@ -107,12 +107,33 @@ function reminderDetails({ dueDate, rule, anchor, active, next }: TaskReminder, 
 
 export function formatNotificationChanges(changes: NotificationChange[], now: number) {
   const label = (slot: NotificationSlot) => `${slot.kind === 'relative' ? offsetLabel(slot.daysBefore) : formatTaskDate(slot.date, now)} ${slot.time}`
+  if (changes.length > 1 && changes.every(({ before, after, summary }) => before && !after && !summary)) {
+    return '\n\n削除：\n' + changes.map(({ before }) => '・' + label(before!)).join('\n')
+  }
   const lines = changes.map(({ before, after, summary }) => {
     if (summary) return summary
     if (before && after) return `変更：${label(before)} → ${label(after)}`
     return before ? `削除：${label(before)}` : after ? `追加：${label(after)}` : ''
   })
   return '\n\n' + lines.join('\n')
+}
+
+export function formatNotificationReason(title: string, changes: NotificationChange[], requested?: string) {
+  const reasons = {
+    explicit: '指定された時刻を使いました。',
+    original: '移動する前の通知時刻を引き継ぎました。',
+    quoted: '引用した通知の時刻に合わせました。',
+    conversation: '直前に話していた通知の時刻に合わせました。',
+    current: 'このタスクで共通、または最も多く設定されていた時刻に合わせました。',
+    group: 'グループの既定の通知時刻に合わせました。',
+    period: '指定された時間帯の標準時刻を使いました。',
+    default: '標準の通知時刻を使いました。',
+  }
+  const change = changes.find(({ after, resolvedTime, timeSource }) =>
+    timeSource && (after?.time ?? resolvedTime) && (!requested || (after?.time ?? resolvedTime) === requested))
+  const explanation = change?.timeSource ? `${change.after?.time ?? change.resolvedTime}：${reasons[change.timeSource]}`
+    : 'その時刻を決めた理由は確認できませんでした。'
+  return `${formatTaskMessage('🔔 通知時刻を決めた理由', title)}\n\n${explanation}`
 }
 
 export function formatTaskResult(heading: string, title: string, category: TaskCategory, reminder: TaskReminder, now: number) {

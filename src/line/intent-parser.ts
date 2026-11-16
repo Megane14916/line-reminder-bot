@@ -12,7 +12,7 @@ const instructions = `家族のLINEで使うタスクBotの操作を分類して
 - 「体操服 1/2」「英検申し込み 11/17」「教科書 明日 持ってく」「履歴書書く 12/5」は新規登録。登録という語は不要。「期限を変更して」など既存操作の意図があれば update_task。「あれもう終わった」は文脈の対象を complete_task。持参する物は belonging、提出・申込み・期限のある作業は deadline。曖昧なカテゴリは deadline。雑談や仮定は {"type":"ignore"}。
 - 不足がある新規登録は {"type":"draft","operation":"create_task","fields":{"title":"物理の教科書を持っていく","category":"belonging","dueDate":"2026-11-17","notice":{"kind":"absolute","date":"2026-11-16"}}}。必要日と通知日を区別する。「今日の夜」「明日の朝」は時刻がないので notice.time を省く。日付が不足する登録でも分かっている項目だけ出す。既存通知の追加で不足があれば operation は edit_notifications、fields は target と notice。notice は DATE と同じ形で不足項目を省く。rule は notice を使わない場合に限る。
 - 参照データの pending.draft に続く回答や訂正は {"type":"continue","fields":{変更・補完する項目だけ}}。「21時」「夜9時」「今日の21時に通知して」は例えば fields.notice={"kind":"absolute","time":"21:00"}。完成済みの操作、または同じ operation の更新済み draft でもよい。質問と無関係な家族の発言には ignore。進行中の取り消しは {"type":"cancel"}。引用があっても、新しい別の依頼は通常の新規操作か新しい draft を返し、引用元や古い依頼の条件を混ぜない。
-- 通知編集の draft は fields.target と順序付き fields.edits にすべての操作を入れる。「前日の通知を消して、3日前の夜に通知して」なら [{"op":"remove","selector":{"kind":"relative","daysBefore":1}},{"op":"add","when":{"kind":"relative","daysBefore":3}}]。朝・夜だけなら時刻欄を省き、他の編集は保持する。「別の日に変えたい」は move の to を省く。「21時」への continue は {"type":"continue","fields":{},"patches":[{"index":1,"when":{"kind":"relative","time":"21:00"}}]}。index は 0 から。明示された取消は {"index":0,"drop":true}、移動先の補完は to を使う。
+- 日付の追加や移動で時刻だけが省略されたら、そのまま時刻欄を省いた操作を返す。TypeScript が元の時刻や現在の設定を使う。対象日が不明な通知編集の draft は fields.target と順序付き fields.edits にすべての操作を入れる。「別の日に変えたい」は move の to を省く。続きの回答は continue、委ねる回答（「任せる」「いつもの時間で」「朝でいい」）は fields を空にする。個別の補足は patches に index（0から）と when または to、項目の取消は drop:true。
 - 通知を追加した結果への引用や直前の追加の言い直しで、単に「やっぱ20時」の場合は recent の move。「8時じゃなくて9時にして」などの一般の通知時刻変更は全体。
 - 完成した登録は {"type":"create_task","title":"教科書","category":"belonging","dueDate":"2026-11-20"} のように平坦に出す。operation と fields を含めるのは draft、fields だけを含めるのは continue。draft の type は必ず "draft"。
 - 【引用元と別の新規登録】参照タスクが「教科書」でも、引用本文「明日体操服持っていくから夜に通知して」は、体操服を新規登録する指示。{"type":"draft","operation":"create_task","fields":{"title":"体操服を持っていく","category":"belonging","dueDate":"2026-11-17","notice":{"kind":"absolute","date":"2026-11-16"}}}（日本時間が2026-11-16の場合）。引用元の教科書の通知設定は編集しない。
@@ -33,7 +33,7 @@ DATE = {"kind":"relative","daysBefore":7,"time":"20:00"} または {"kind":"abso
 SELECTOR = DATE、{"kind":"time","time":"08:00"}、または {"kind":"recent"}（明示的に参照する通知）。日だけ指定なら time は省略。「この通知の8時を9時に」のように変更元も明示した場合は recent に time を付ける。
 edits の形式:
 - {"op":"add","when":DATE}。「にも」「も追加」「そのままで」は追加。時刻が省略されたら time フィールドを出さない。TypeScript が最新ルール・会話から決める。「朝8時にも」のように日付なしで時刻だけの追加は {"op":"add_clock","time":"08:00"}。
-- {"op":"remove","selector":SELECTOR}。「前日の通知は消して」は {"kind":"relative","daysBefore":1}。「その通知だけ消して」は recent。通知全部が不要なら disable_reminder。
+- {"op":"remove","selector":SELECTOR}。「前日の通知は外して」「前日はいらない」は {"kind":"relative","daysBefore":1}。「その通知だけ消して」は recent。通知全部が不要なら disable_reminder。
 - {"op":"move","selector":SELECTOR,"to":DATE または {"kind":"time","time":"09:00"}} は日付や「この通知だけ」で特定した枠の変更。「7日前の通知だけ9時にして」は relative 7 → time 09:00。「それじゃなくて3日前」は recent → relative 3。引用や直近の操作があるだけでは個別にしない。
 - {"op":"shift","selector":{"kind":"recent"},"minutes":60} は「追加したやつを1時間遅くして」。
 - {"op":"undo_remove"} は「いや、今のは消さないで」。

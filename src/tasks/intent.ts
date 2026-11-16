@@ -7,7 +7,7 @@ const category = z.enum(['deadline', 'belonging'])
 const title = z.string().trim().min(1).max(100).regex(/^[^\u0000\r\n]+$/)
 const date = z.iso.date()
 const target = z.discriminatedUnion('by', [
-  z.strictObject({ by: z.literal('name'), name: title, dueDate: date.optional() }),
+  z.strictObject({ by: z.literal('name'), name: title, dueDate: date.optional(), category: category.optional(), status: z.enum(['open', 'done']).optional() }),
   z.strictObject({ by: z.literal('id'), id: z.number().int().positive().max(Number.MAX_SAFE_INTEGER) }),
   z.strictObject({ by: z.literal('recent') }),
 ])
@@ -24,6 +24,7 @@ export const intentSchema = z.discriminatedUnion('type', [
     z.strictObject({ by: z.literal('rule'), rule: ruleSchema }), z.strictObject({ by: z.literal('time'), time: timeSchema }),
   ]) }),
   taskOperation('disable_reminder'), taskOperation('enable_reminder'), taskOperation('get_reminder'),
+  taskOperation('get_reminder_reason'),
   taskOperation('modify_reminder').extend({ edit: reminderEditSchema }),
   taskOperation('edit_notifications').extend({ edits: z.array(notificationEditSchema).min(1).max(8) }),
   z.strictObject({ type: z.literal('set_group_default'), rule: ruleSchema }),

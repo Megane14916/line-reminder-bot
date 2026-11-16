@@ -3,6 +3,8 @@ import { saveOperationResult, type OperationResult } from '../line/outbox'
 import { namesTarget, taskKey } from './target-matching'
 import { storeConversation, trimConversation, type ConversationEntry, type Turn } from './conversation'
 import { saveDialogue, supersedeDialogues, type Dialogue, type PendingDialogue } from './dialogue'
+import { ruleSchema } from './schedule'
+import type { Daypart } from './notification-clock'
 
 export type TaskCategory = 'deadline' | 'belonging'
 export type Task = {
@@ -19,6 +21,9 @@ export type TaskEvent = {
   interpretedAction?: TaskAction
   quoteTaskId?: number | null
   quotedAt?: number | null
+  quotedTurn?: Turn
+  explicitTaskId?: number
+  delegatedPeriod?: Daypart
   linkTask?: boolean
   observedTask?: { id: number; version: number }
   history?: ConversationEntry[]
@@ -50,12 +55,25 @@ async function searchableTasks(db: D1Database, groupId: string, dueDate: string 
   return results.length > 200 ? undefined : results
 }
 
-export async function findTasks(db: D1Database, groupId: string, name: string, dueDate: string | undefined, deleted: boolean) {
+export async function findTasks(db: D1Database, groupId: string, name: string, dueDate: string | undefined, deleted: boolean,
+  filter?: { category?: TaskCategory; status?: Task['status'] }) {
   const tasks = await searchableTasks(db, groupId, dueDate, deleted)
   if (!tasks) return
+  const candidates = tasks.filter((task) => (!filter?.category || task.category === filter.category) && (!filter?.status || task.status === filter.status))
   const key = taskKey(name)
-  const exact = tasks.filter((task) => task.title === name || (key.length >= 2 && taskKey(task.title) === key))
-  return (exact.length || key.length < 2 ? exact : tasks.filter((task) => namesTarget(task.title, name))).slice(0, 6)
+  const exact = candidates.filter((task) => task.title === name || (key.length >= 2 && taskKey(task.title) === key))
+  return (exact.length || key.length < 2 ? exact : candidates.filter((task) => namesTarget(task.title, name))).slice(0, 6)
+}
+
+export async function onlyOpenTask(db: D1Database, groupId: string) {
+  const { results } = await db.prepare("SELECT * FROM tasks WHERE group_id = ? AND status = 'open' AND deleted_at IS NULL LIMIT 2")
+    .bind(groupId).all<Task>()
+  return results.length === 1 ? results[0] : undefined
+}
+
+export async function groupReminderRule(db: D1Database, groupId: string) {
+  const value = await db.prepare('SELECT rule_json FROM group_reminder_defaults WHERE group_id = ?').bind(groupId).first<string>('rule_json')
+  return value ? ruleSchema.parse(JSON.parse(value)) : undefined
 }
 
 export async function mentionedTask(db: D1Database, groupId: string, text: string) {
@@ -80,13 +98,14 @@ export function getTask(db: D1Database, groupId: string, id: number) {
   return db.prepare('SELECT * FROM tasks WHERE group_id = ? AND id = ?').bind(groupId, id).first<Task>()
 }
 
-export const sentMessage = `SELECT task_id, NULL AS scheduled_at, thread_id, thread_question FROM operation_result_outbox
+export const sentMessage = `SELECT task_id, NULL AS scheduled_at, thread_id, thread_question,
+    (SELECT turn_json FROM task_conversation WHERE event_id = operation_result_outbox.event_id) AS turn_json FROM operation_result_outbox
   WHERE group_id = ? AND line_message_id = ? AND status = 'sent'
-  UNION ALL SELECT task_id, scheduled_at, NULL, 0 FROM reminder_occurrences WHERE group_id = ? AND line_message_id = ? AND status = 'sent'`
+  UNION ALL SELECT task_id, scheduled_at, NULL, 0, NULL FROM reminder_occurrences WHERE group_id = ? AND line_message_id = ? AND status = 'sent'`
 
 export function getBotMessage(db: D1Database, groupId: string, messageId: string) {
   return db.prepare(sentMessage).bind(groupId, messageId, groupId, messageId)
-    .first<{ task_id: number | null; scheduled_at: number | null; thread_id: string | null; thread_question: number }>()
+    .first<{ task_id: number | null; scheduled_at: number | null; thread_id: string | null; thread_question: number; turn_json: string | null }>()
 }
 
 export function pendingContext(context: TaskContext | null) {

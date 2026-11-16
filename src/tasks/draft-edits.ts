@@ -1,5 +1,5 @@
 import type { DraftEdit, DraftEditPatch, TaskDraft } from './intent'
-import { explicitNotificationDates, explicitNotificationTimes, relativeDays } from './notification-dates'
+import { explicitNotificationDates, explicitNotificationTimes, keepNoticeWords, relativeDays, removalWords } from './notification-dates'
 
 type Destination = NonNullable<Extract<DraftEdit, { op: 'add' }>['when']> |
   NonNullable<Extract<DraftEdit, { op: 'move' }>['to']>
@@ -9,14 +9,14 @@ export function draftEdits(fields: Fields): DraftEdit[] {
   return fields.edits ?? (fields.notice ? [{ op: 'add', when: fields.notice }] : [])
 }
 
-export function nextEditQuestion(edits: DraftEdit[]) {
+export function nextEditQuestion(edits: DraftEdit[], autofill = false) {
   for (const [index, edit] of edits.entries()) {
     const value = edit.op === 'add' ? edit.when : edit.op === 'move' ? edit.to : undefined
     if ((edit.op === 'add' || edit.op === 'move') && (!value ||
       value.kind === 'absolute' && !value.date || value.kind === 'relative' && value.daysBefore === undefined)) {
       return { index, question: 'day' as const }
     }
-    if (value && !value.time || (edit.op === 'add_clock' || edit.op === 'set_clock') && !edit.time) {
+    if (value && !value.time && (!autofill || value.kind === 'time') || (edit.op === 'add_clock' || edit.op === 'set_clock') && !edit.time) {
       return { index, question: 'time' as const }
     }
   }
@@ -27,8 +27,8 @@ function hasDay(value: Destination, text: string, now: number) {
     : value.kind === 'relative' && relativeDays(text.normalize('NFKC')).includes(value.daysBefore ?? -1)
 }
 
-const originalRemoval = /(?:消して|削除(?:して|したい)|いらな|なくして|取り除いて)/
-const keep = /(?:消さない|消すの(?:は|を)やめ|削除しない|削除(?:は|を)(?:取り消|やめ)|残して|そのまま)/
+const originalRemoval = removalWords
+const keep = new RegExp(keepNoticeWords.source + '|消すの(?:は|を)やめ|削除(?:は|を)(?:取り消|やめ)')
 const correction = /(?:やっぱ|変更|変えて|じゃなく|ではなく|代わり|にして)/
 const clauses = (text: string) => text.split(/[、,。\n]/).map((clause) => clause.trim()).filter(Boolean)
 
@@ -164,8 +164,4 @@ export function reconcileEditedDraft(fields: Fields, update: Update, text: strin
   // Keep the user evidence used for final validation, without asking the model to reconstruct it.
   const answer = evidence.filter((clause) => !keep.test(clause))
   return { edits: next, editText: [...new Set([...grounding, ...answer])].join('。') }
-}
-
-export function withoutVagueClock(text: string) {
-  return text.replace(/(?:の)?(?:朝|夜|夕方)(?=(?:にも|に通知|の通知))/g, '')
 }
