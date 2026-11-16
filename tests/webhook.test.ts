@@ -1617,7 +1617,7 @@ test('keeps settings-only edits paused and resumes future reminders without reop
   expect(lastReply()).not.toContain('通知を再開')
 }, 20_000)
 
-test('passes scoped live state and recent operations, inherits a changed clock, and expires conversation', async () => {
+test('passes scoped live state, uses the fallback for tied clocks, and expires conversation', async () => {
   vi.spyOn(Date, 'now').mockReturnValue(calendarNow)
   const setup = { ...calendarTask, rule: { type: 'offsets', slots: [
     { daysBefore: 7, time: '08:00' }, { daysBefore: 1, time: '20:00' },
@@ -1634,7 +1634,7 @@ test('passes scoped live state and recent operations, inherits a changed clock, 
   const { DB } = platform.env
   const turn = await DB.prepare("SELECT turn_json FROM task_conversation WHERE json_extract(turn_json,'$.request') = ?")
     .bind('3週間前にも通知して').first<string>('turn_json')
-  expect(JSON.parse(turn ?? '{}')).toMatchObject({ changes: [{ after: relativeDate(21, '09:00'), timeSource: 'conversation' }] })
+  expect(JSON.parse(turn ?? '{}')).toMatchObject({ changes: [{ after: relativeDate(21, '20:00'), timeSource: 'default' }] })
 
   // Another user changes the latest D1 version. The first user's old focus cannot be used.
   await command('英検の通知を全部20時にして', { ...plan({ op: 'set_clock', time: '20:00' }), target: byName('英検') }, { userId: 'user-b' })
