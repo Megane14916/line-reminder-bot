@@ -89,6 +89,7 @@ Remove-Item Env:RUN_REAL_DIALOGUE_EVAL
 
 ## 設定と本番反映
 
-- `wrangler.jsonc` の `ai.binding` は `AI`、`vars.AI_MODEL` の初期値は `@cf/qwen/qwen3-30b-a3b-fp8` です。日本語と JSON 出力をサポートする Workers AI モデルを指定してください。Workers AI バインディングはアカウントに紐づき、専用の API キーを Worker に置く必要はありません。ローカルで実推論を試す場合は Workers AI を利用できるアカウントで `npx.cmd wrangler login` してください。[モデル仕様](https://developers.cloudflare.com/workers-ai/models/qwen3-30b-a3b-fp8/)
+- `wrangler.jsonc` の `ai.binding` は `AI`、`vars.AI_MODEL` の初期値は `@cf/qwen/qwen3.8-27b` です。このモデルでは応答時間を抑えるため `reasoning_effort: "low"` と `chat_template_kwargs.enable_thinking: false` を指定します。日本語と JSON 出力をサポートする Workers AI モデルを指定してください。Workers AI バインディングはアカウントに紐づき、専用の API キーを Worker に置く必要はありません。ローカルで実推論を試す場合は Workers AI を利用できるアカウントで `npx.cmd wrangler login` してください。[モデル仕様](https://developers.cloudflare.com/workers-ai/models/qwen3.8-27b/)
+- `ai_unavailable` は Workers AI 呼び出しの失敗です。旧モデル `@cf/qwen/qwen3-30b-a3b-fp8` は2026年11月20日に提供終了となり、エラー5028を返します。最新の設定で Worker を再起動し、ローカルの `.dev.vars` や環境変数で旧モデルを上書きしていないか確認してください。[提供終了の案内](https://developers.cloudflare.com/changelog/post/2026-11-05-planned-model-deprecations/)
 - 承認後、`wrangler.jsonc` の D1 ID を実際のものに置き換え、`npx.cmd wrangler d1 migrations apply DB --remote` で `0009` までの未適用分を適用します。ローカルでは `npx.cmd wrangler d1 migrations apply DB --local` を使います。既存のタスク・送信履歴は保持されます。新バージョンで旧2本の Cron が無効になり、毎分 Cron が有効になったことを確認します。移行前に旧方式で同日の前日通知が受理されたか不明な場合も、重複防止のため同じ前日20時の枠をスキップします。
 - LINE Secrets を Git 管理外の `.env.production` に設定して `npx.cmd wrangler deploy --secrets-file .env.production` で手動反映します。テストグループで登録・通知・引用返信を確認後、家族グループで使います。通知の通数は LINE のプラン、推論は Workers AI の利用量に応じます。[LINE の料金](https://developers.line.biz/ja/docs/messaging-api/pricing/) · [Workers AI 料金](https://developers.cloudflare.com/workers-ai/platform/pricing/)

@@ -16,7 +16,7 @@ import { reminderSlots, ruleSchema } from '../src/tasks/schedule'
 const secret = 'test-secret'
 const now = Date.parse('2030-12-01T10:00:00+09:00')
 const group = 'group-a'
-const model = '@cf/qwen/qwen3-30b-a3b-fp8'
+const model = '@cf/qwen/qwen3.8-27b'
 const infer = vi.fn()
 const ai = { run: infer } as unknown as Ai
 let platform: Awaited<ReturnType<typeof testPlatform>>
@@ -574,7 +574,7 @@ test('creates and deduplicates a related create-and-reminder request and lists b
   await webhook([request])
   expect(infer).toHaveBeenCalledTimes(1)
   expect(infer.mock.calls[0][1]).toMatchObject({ messages: [expect.anything(), expect.anything(), { role: 'user', content: '12月20日のレポートを登録。1週間前から毎日通知して' }],
-    response_format: { type: 'json_object' } })
+    response_format: { type: 'json_object' }, reasoning_effort: 'low', chat_template_kwargs: { enable_thinking: false } })
   expect(lastReply()).toBe('✅ タスクを登録しました\n\nレポート\n期限：12月20日（金）\n種類：提出物\n通知：7日前から前日まで毎日\n時刻：20:00')
   expect((await taskRows()).results).toMatchObject([{ reminder_rule: JSON.stringify(rule), next_reminder_at: Date.parse('2030-12-13T20:00:00+09:00') }])
   expect(await command('12月の提出物', { type: 'list_tasks', from: '2030-12-01', to: '2030-12-31', category: 'deadline' }))
@@ -904,7 +904,7 @@ describe.runIf(evaluationEnv.RUN_REAL_DIALOGUE_EVAL === '1')('Workers AI dialogu
     vi.mocked(Date.now).mockReturnValue(deviceNow)
     const raw: unknown[] = []
     const latencies: number[] = []
-    infer.mockImplementation(async (name: typeof model, input: Ai_Cf_Qwen_Qwen3_30B_A3B_Fp8_Input) => {
+    infer.mockImplementation(async (name: typeof model, input: AiModels[typeof model]['inputs']) => {
       const start = performance.now()
       const output = await remote.env.AI.run(name, input)
       latencies.push(Math.round(performance.now() - start))
@@ -952,7 +952,7 @@ describe.runIf(evaluationEnv.RUN_REAL_DIALOGUE_EVAL === '1')('Workers AI dialogu
     vi.mocked(Date.now).mockReturnValue(deviceNow)
     const raw: unknown[] = []
     let index = 0
-    infer.mockImplementation(async (modelName: typeof model, input: Ai_Cf_Qwen_Qwen3_30B_A3B_Fp8_Input) => {
+    infer.mockImplementation(async (modelName: typeof model, input: AiModels[typeof model]['inputs']) => {
       const format = turns[index].format
       const result = await remote.env.AI.run(modelName, format && 'messages' in input && input.messages ? {
         ...input, messages: input.messages.map((message, position) => position === 0
@@ -1003,7 +1003,7 @@ describe.runIf(evaluationEnv.RUN_REAL_DIALOGUE_EVAL === '1')('Workers AI dialogu
       await DB.prepare('INSERT INTO tasks (group_id, category, title, due_date, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?)')
         .bind(group, 'deadline', '別の提出物', '2026-12-10', 'seed', deviceNow).run()
     }
-    infer.mockImplementation(async (name: typeof model, input: Ai_Cf_Qwen_Qwen3_30B_A3B_Fp8_Input) => remote.env.AI.run(name, input))
+    infer.mockImplementation(async (name: typeof model, input: AiModels[typeof model]['inputs']) => remote.env.AI.run(name, input))
     const replies: (string | undefined)[] = []
     let questions = 0
     let mutations = 0

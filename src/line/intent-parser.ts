@@ -116,6 +116,8 @@ export async function parseIntent(ai: Ai, model: string, text: string, now: numb
         { timeZone: 'Asia/Tokyo', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(now)}。` },
         ...reference, { role: 'user', content: text }],
       response_format: { type: 'json_object' }, max_tokens: 1024, temperature: 0,
+      ...(model === '@cf/qwen/qwen3.8-27b'
+        ? { reasoning_effort: 'low', chat_template_kwargs: { enable_thinking: false } } : {}),
     }, { signal: controller.signal }), deadline])
   } catch {
     return { kind: controller.signal.aborted ? 'timeout' : 'unavailable' }

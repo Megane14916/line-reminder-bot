@@ -9,7 +9,7 @@ import { defaultRule, reminderSlots } from '../src/tasks/schedule'
 import { literalNotificationEdits, notificationActivation, refersToQuotedNotification } from '../src/tasks/notification-dates'
 import { conversationCases, evaluationNow as now, evaluationTask as task, previousCases, retimingCases, type IntentFixture } from './conversation-cases'
 
-const model = '@cf/qwen/qwen3-30b-a3b-fp8'
+const model = '@cf/qwen/qwen3.8-27b'
 const env = (globalThis as typeof globalThis & { process: { env: Record<string, string | undefined> } }).process.env
 const cases = [...previousCases, ...conversationCases, ...retimingCases]
 
@@ -77,7 +77,7 @@ describe.runIf(env.RUN_REAL_INTENT_EVAL === '1')('Workers AI (real model)', () =
       platform = await getPlatformProxy<Env>({ persist: false, remoteBindings: true, envFiles: [] })
       const binding = platform.env.AI
       // The test proxy cannot transfer AbortSignal. parseIntent still enforces its local deadline.
-      ai = { async run(name: typeof model, input: Ai_Cf_Qwen_Qwen3_30B_A3B_Fp8_Input) {
+      ai = { async run(name: typeof model, input: AiModels[typeof model]['inputs']) {
         try {
           return await binding.run(name, input)
         } catch (error) {
