@@ -1003,7 +1003,48 @@ describe.runIf(evaluationEnv.RUN_REAL_DIALOGUE_EVAL === '1')('Workers AI dialogu
       await DB.prepare('INSERT INTO tasks (group_id, category, title, due_date, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?)')
         .bind(group, 'deadline', '別の提出物', '2026-12-10', 'seed', deviceNow).run()
     }
-    infer.mockImplementation(async (name: typeof model, input: AiModels[typeof model]['inputs']) => remote.env.AI.run(name, input))
+    const reasoning = evaluationEnv.AI_EVAL_REASONING
+    const measuring = reasoning !== undefined
+    if (measuring && !['off', 'low', 'medium', 'xhigh'].includes(reasoning)) throw new Error('Unknown AI_EVAL_REASONING')
+    const samples: { elapsedMs?: number; completed?: boolean; error?: string; providerCode?: string; schema?: boolean; finishReason?: string;
+      promptTokens?: number; completionTokens?: number; reasoningTokens?: number; reasoningCharacters?: number }[] = []
+    const requests: Promise<unknown>[] = []
+    infer.mockImplementation((name: typeof model, input: AiModels[typeof model]['inputs']) => {
+      const start = performance.now()
+      const sample: typeof samples[number] = {}
+      samples.push(sample)
+      const options = measuring ? { ...input,
+        messages: input.messages.map((message) => message.role === 'system' && typeof message.content === 'string'
+          ? { ...message, content: message.content.replace(/\/no_think/g, '') } : message),
+        reasoning_effort: reasoning === 'off' ? 'low' as const
+        : reasoning as 'low' | 'medium' | 'xhigh',
+        chat_template_kwargs: { ...input.chat_template_kwargs, enable_thinking: reasoning !== 'off' } } : input
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const request = Promise.race([remote.env.AI.run(name, options),
+        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('evaluation_deadline')), 30_000) })])
+        .then((result) => {
+          const output = result as ChatCompletionsOutput
+          const message = output.choices?.[0]?.message
+          try {
+            const proposal = JSON.parse(String(message?.content))
+            sample.schema = intentSchema.safeParse(proposal).success || dialogueSchema.safeParse(proposal).success
+          } catch { sample.schema = false }
+          Object.assign(sample, { completed: true, finishReason: output.choices?.[0]?.finish_reason,
+            promptTokens: output.usage?.prompt_tokens, completionTokens: output.usage?.completion_tokens,
+            reasoningTokens: output.usage?.completion_tokens_details?.reasoning_tokens,
+            reasoningCharacters: String((message as { reasoning?: string } | undefined)?.reasoning ?? '').length })
+          return result
+        }, (error) => {
+          sample.error = error instanceof Error && error.message === 'evaluation_deadline' ? 'evaluation_deadline' : 'request_failed'
+          sample.providerCode = error instanceof Error ? /^(\d{4,6}):/.exec(error.message)?.[1] : undefined
+          throw new Error('Evaluation inference failed')
+        }).finally(() => {
+          if (timer !== undefined) clearTimeout(timer)
+          sample.elapsedMs = Math.round(performance.now() - start)
+        })
+      requests.push(request)
+      return request
+    })
     const replies: (string | undefined)[] = []
     let questions = 0
     let mutations = 0
@@ -1023,13 +1064,26 @@ describe.runIf(evaluationEnv.RUN_REAL_DIALOGUE_EVAL === '1')('Workers AI dialogu
         .map((time) => new Date(time + 9 * 3_600_000).toISOString().slice(5, 16).replace('T', ' ')))
     const wrongTask = rows.some((row) => row.title === '別の提出物' && row.reminder_version !== 1)
     const exact = JSON.stringify(actual) === JSON.stringify(scenario.expected)
+    if (measuring) {
+      // Include late inference responses in latency measurements, while D1 reflects the normal 12-second deadline.
+      await Promise.allSettled(requests)
+      if (samples.some((sample) => sample.providerCode === '4006')) {
+        throw new Error('Workers AI daily allocation exhausted (4006). Exclude this run and resume after the allocation resets.')
+      }
+      const failures = (await DB.prepare('SELECT last_error FROM webhook_inbox WHERE last_error IS NOT NULL')
+        .all<{ last_error: string }>()).results.map(({ last_error }) => last_error)
+      console.info(JSON.stringify({ reasoningEvaluation: true, mode: reasoning, round: evaluationEnv.AI_EVAL_ROUND,
+        scenario: scenario.name, turns: scenario.turns.length, samples, questions, mutations, wrongTask, exact, failures,
+        passed: exact && questions === ('question' in scenario ? 1 : 0) && !wrongTask, actual }))
+      return
+    }
     console.info(JSON.stringify({ autofill: scenario.name, turns: scenario.turns.length, questions, mutations, wrongTask, exact, actual, replies }))
     if (evaluationEnv.AUTOFILL_BASELINE !== '1') {
       expect(actual).toEqual(scenario.expected)
       expect(questions).toBe('question' in scenario ? 1 : 0)
       expect(wrongTask).toBe(false)
     }
-  }, 60_000)
+  }, evaluationEnv.AI_EVAL_REASONING ? 120_000 : 60_000)
 })
 
 test.each([
