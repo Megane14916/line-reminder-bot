@@ -1,6 +1,10 @@
 import { Hono } from 'hono'
 import { lineWebhook } from './line/webhook'
-import { deadlineCron, retryCron, retryDeadlineReminders, sendDeadlineReminders } from './reminders'
+import { drainInbox } from './line/inbox'
+import { drainResults } from './line/outbox'
+import { reminderCron, runReminders } from './reminders'
+import { runtimeBudget, withinBudget } from './runtime-budget'
+import { expireConversation } from './tasks/conversation'
 
 export const app = new Hono<{ Bindings: Env }>()
 
@@ -10,12 +14,16 @@ app.route('/webhook/line', lineWebhook)
 export default {
   fetch: app.fetch,
   async scheduled(controller, env) {
-    try {
-      if (controller.cron === deadlineCron) await sendDeadlineReminders(env, controller.scheduledTime)
-      if (controller.cron === retryCron) await retryDeadlineReminders(env)
-    } catch {
-      console.error('Deadline reminder cron failed', { cron: controller.cron, stage: 'load', kind: 'configuration_or_d1' })
-      throw new Error('Could not start deadline reminder processing')
-    }
+    if (controller.cron !== reminderCron) return
+    const budget = runtimeBudget()
+    await withinBudget(budget, async () => {
+      const jobs = ['inbox', 'outbox', 'reminders', 'conversation']
+      const results = await Promise.allSettled([drainInbox(env, budget), drainResults(env, budget), runReminders(env, budget.clock, budget),
+        expireConversation(env.DB, budget.clock())])
+      results.forEach((result, index) => {
+        if (result.status === 'rejected') console.error('Scheduled processing failed', { job: jobs[index] })
+      })
+      if (results.some((result) => result.status === 'rejected')) throw new Error('Scheduled processing failed')
+    })
   },
 } satisfies ExportedHandler<Env>

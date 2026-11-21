@@ -1,92 +1,189 @@
-import type { ActionResult, TaskAction } from '../tasks/actions'
 import type { Task, TaskCategory } from '../tasks/repository'
+import type { Clarification } from '../tasks/intent'
+import type { NotificationChange, NotificationSlot } from '../tasks/notification-plan'
+import { defaultReminderOffsets, type ReminderRule } from '../tasks/schedule'
+import { daysUntil, todayInJapan } from '../tasks/validation'
 
-const menuItems = [
-  { data: 'add_deadline', label: '期限を追加', action: { type: 'start_create', category: 'deadline' } },
-  { data: 'add_belonging', label: '持ち物を追加', action: { type: 'start_create', category: 'belonging' } },
-  { data: 'list_tasks', label: '一覧を見る', action: { type: 'list' } },
-  { data: 'help', label: '使い方', action: { type: 'help' } },
-] satisfies { data: string; label: string; action: TaskAction | { type: 'help' } }[]
+const timeZone = 'Asia/Tokyo'
+const dateOptions = { timeZone, month: 'long', day: 'numeric', weekday: 'short' } as const
+const shortDate = new Intl.DateTimeFormat('ja-JP', dateOptions)
+const fullDate = new Intl.DateTimeFormat('ja-JP', { ...dateOptions, year: 'numeric' })
+const time = new Intl.DateTimeFormat('ja-JP', { timeZone, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
+const weekdays = ['日', '月', '火', '水', '木', '金', '土']
+const categories = { deadline: '提出物', belonging: '持ち物' }
 
-export const helpMessage = textMessage('Bot にメンションして操作メニューを開きます。追加を選んだら「11/20 水筒」のように日付とタイトルを送り、確認ボタンを押してください。完了と削除は一覧から操作できます。')
+export function formatTaskDate(date: string, now: number) {
+  const at = Date.parse(`${date}T00:00:00+09:00`)
+  if (!Number.isFinite(at) || todayInJapan(at) !== date) return date
+  const formatter = date.slice(0, 4) === todayInJapan(now).slice(0, 4) ? shortDate : fullDate
+  return formatter.format(at).replace('(', '（').replace(')', '）')
+}
 
-export function parsePostback(data: unknown): TaskAction | { type: 'help' } | undefined {
-  if (typeof data !== 'string') return
-  const item = menuItems.find((item) => item.data === data)
-  if (item) return item.action
+function formatTitle(title: string) {
+  // A legacy title can have 100 Unicode characters, or up to 200 UTF-16 units.
+  const chars = [...title.replace(/[\p{Cc}\u2028\u2029\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]+/gu, ' ').trim()]
+  return (chars.length > 100 ? chars.slice(0, 99).join('') + '…' : chars.join('')) || '（名前なし）'
+}
 
-  const task = /^(complete|delete):([1-9][0-9]*)$/.exec(data)
-  if (task) {
-    const taskId = Number(task[2])
-    if (Number.isSafeInteger(taskId)) return { type: task[1] === 'complete' ? 'complete' : 'request_delete', taskId }
+export function formatTaskMessage(heading: string, title: string) {
+  return `${heading}\n\n${formatTitle(title)}`
+}
+
+function listDetails(task: Task, now: number) {
+  return `期限：${formatTaskDate(task.due_date, now)}｜${categories[task.category]}`
+}
+
+export function formatTaskList(tasks: Task[], status: 'open' | 'done' | 'deleted' | undefined, truncated: boolean, now: number) {
+  if (!tasks.length) return '該当するタスクはありません。'
+  const labels = { open: '未完了のタスク', done: '完了済みのタスク', deleted: '削除済みのタスク' }
+  const blocks = tasks.map((task) => `${formatTitle(task.title)}\n${listDetails(task, now)}`)
+  if (truncated) blocks.push(`最初の${tasks.length}件を表示しています。`)
+  return [`📋 ${labels[status ?? 'open']}（${tasks.length}件）`, ...blocks].join('\n\n')
+}
+
+export function formatTaskCandidates(tasks: Task[], truncated: boolean, now: number) {
+  const blocks = tasks.map((task) => `#${task.id} ${formatTitle(task.title)}\n${listDetails(task, now)}`)
+  if (truncated) blocks.push('ほかにも候補があります。期限を添えると絞り込めます。')
+  return ['🔎 どのタスクですか？\n選択用の番号を、#も付けてメンションなしで送ってください。', ...blocks].join('\n\n')
+}
+
+type TaskReminder = {
+  dueDate: string
+  rule: ReminderRule
+  anchor: number
+  active: boolean
+  next: number | null
+}
+
+function offsetLabel(days: number) {
+  if (days === 0) return '当日'
+  if (days === 1) return '前日'
+  return `${days}日前`
+}
+
+type Offset = Extract<ReminderRule, { type: 'offsets' }>['slots'][number]
+
+function formatOffsets(offsets: Offset[]) {
+  const slots = [...offsets].sort((a, b) => b.daysBefore - a.daysBefore || a.time.localeCompare(b.time))
+  const times = new Set(slots.map((slot) => slot.time))
+  if (times.size === 1) {
+    const days = [...new Set(slots.map((slot) => offsetLabel(slot.daysBefore)))]
+    return `通知：${days.join('・')} ${slots[0].time}`
   }
-
-  const confirmation = /^confirm:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/.exec(data)
-  if (confirmation) return { type: 'confirm', token: confirmation[1] }
+  const entries = [...new Set(slots.map((slot) => `・${offsetLabel(slot.daysBefore)} ${slot.time}`))]
+  return ['通知：', ...entries].join('\n')
 }
 
-export function createMenuMessage() {
-  return flexMessage('家族Botの操作メニュー', bubble(menuItems.map(({ data, label }) => button(label, data))))
+function formatRepeat(rule: Extract<ReminderRule, { type: 'repeat' }>, startLabel: string) {
+  const from = rule.startDaysBefore === null ? startLabel : offsetLabel(rule.startDaysBefore)
+  const through = offsetLabel(rule.endDaysBefore)
+  const times = [...new Set(rule.times)].sort()
+  const days = [...new Set(rule.weekdays)].sort((a, b) => (a + 6) % 7 - (b + 6) % 7)
+  const weekdayNames = days.map((day) => weekdays[day] + '曜日').join('・')
+  const frequency = days.length ? `毎週${weekdayNames}`
+    : rule.everyDays === 1 ? '毎日' : rule.everyDays === 7 ? '毎週' : `${rule.everyDays}日おき`
+  const period = rule.startDaysBefore === rule.endDaysBefore
+    ? through + (weekdayNames ? `（${weekdayNames}の場合）` : '')
+    : `${from}から${through}まで${frequency}`
+  const when = times.length === 1 ? `時刻：${times[0]}` : ['時刻：', ...times.map((slot) => `・${slot}`)].join('\n')
+  const notes = [`通知：${period}`, when]
+  if (rule.extraSlots?.length) notes.push(formatOffsets(rule.extraSlots).replace('通知：', '追加：'))
+  if (rule.excludedSlots?.length) notes.push(formatOffsets(rule.excludedSlots).replace('通知：', '除外：'))
+  return notes.join('\n')
 }
 
-export function createActionMessages(result: ActionResult): ReplyMessage[] {
-  switch (result.type) {
-    case 'text':
-      return [textMessage(result.text)]
-    case 'confirm_create': {
-      const { draft, token } = result
-      return [flexMessage('登録の確認', bubble([
-        flexText(`${categoryLabel(draft.category)} ${draft.dueDate}\n${draft.title}`),
-        button('登録する', `confirm:${token}`),
-      ]))]
-    }
-    case 'confirm_delete':
-      return [flexMessage('削除の確認', bubble([
-        flexText(`${taskLabel(result.task)}\nこのタスクを削除しますか？`),
-        button('削除する', `confirm:${result.token}`),
-      ]))]
-    case 'list': {
-      if (!result.tasks.length) return [textMessage('未完了のタスクはありません。')]
-      const messages: ReplyMessage[] = []
-      if (result.truncated) messages.push(textMessage('未完了のタスクのうち、期限が近い順に最初の20件を表示します。'))
-      // LINE accepts at most 12 bubbles per carousel.
-      for (let start = 0; start < result.tasks.length; start += 12) {
-        const contents = result.tasks.slice(start, start + 12).map((task) => bubble([
-          flexText(taskLabel(task)), button('完了', `complete:${task.id}`), button('削除', `delete:${task.id}`),
-        ]))
-        messages.push(flexMessage('未完了のタスク', { type: 'carousel', contents }))
-      }
-      return messages
-    }
+function reminderDetails({ dueDate, rule, anchor, active, next }: TaskReminder, now: number, showNext: boolean) {
+  if (!active) return '通知：停止中'
+  let summary = rule.type === 'repeat' ? formatRepeat(rule, '設定日')
+    : formatOffsets(rule.type === 'default' ? defaultReminderOffsets(dueDate, anchor) : rule.slots)
+  if (rule.type !== 'default' && rule.absoluteSlots?.length) {
+    const dates = rule.absoluteSlots.map((slot) => `・${formatTaskDate(slot.date, now)} ${slot.time}`).join('\n')
+    summary = (rule.type === 'offsets' && !rule.slots.length ? '通知：\n' : summary + '\n指定日：\n') + dates
   }
+  if (next === null) return `${summary}\n今後の通知予定はありません。`
+  if (!showNext) return summary
+  return `${summary}\n次回：${formatTaskDate(todayInJapan(next), now)}${time.format(next)}`
 }
 
-function categoryLabel(category: TaskCategory) {
-  return category === 'deadline' ? '期限' : '持ち物'
+export function formatNotificationChanges(changes: NotificationChange[], now: number) {
+  const label = (slot: NotificationSlot) => `${slot.kind === 'relative' ? offsetLabel(slot.daysBefore) : formatTaskDate(slot.date, now)} ${slot.time}`
+  if (changes.length > 1 && changes.every(({ before, after, summary }) => before && !after && !summary)) {
+    return '\n\n削除：\n' + changes.map(({ before }) => '・' + label(before!)).join('\n')
+  }
+  const lines = changes.map(({ before, after, summary }) => {
+    if (summary) return summary
+    if (before && after) return `変更：${label(before)} → ${label(after)}`
+    return before ? `削除：${label(before)}` : after ? `追加：${label(after)}` : ''
+  })
+  return '\n\n' + lines.join('\n')
 }
 
-function taskLabel(task: Task) {
-  return `${categoryLabel(task.category)} ${task.due_date}\n${task.title}\n#${task.id}`
+export function formatNotificationReason(title: string, changes: NotificationChange[], requested?: string) {
+  const reasons = {
+    explicit: '指定された時刻を使いました。',
+    original: '移動する前の通知時刻を引き継ぎました。',
+    quoted: '引用した通知の時刻に合わせました。',
+    conversation: '直前に話していた通知の時刻に合わせました。',
+    current: 'このタスクで共通、または最も多く設定されていた時刻に合わせました。',
+    group: 'グループの既定の通知時刻に合わせました。',
+    period: '指定された時間帯の標準時刻を使いました。',
+    default: '標準の通知時刻を使いました。',
+  }
+  const change = changes.find(({ after, resolvedTime, timeSource }) =>
+    timeSource && (after?.time ?? resolvedTime) && (!requested || (after?.time ?? resolvedTime) === requested))
+  const explanation = change?.timeSource ? `${change.after?.time ?? change.resolvedTime}：${reasons[change.timeSource]}`
+    : 'その時刻を決めた理由は確認できませんでした。'
+  return `${formatTaskMessage('🔔 通知時刻を決めた理由', title)}\n\n${explanation}`
 }
 
-function textMessage(text: string) {
-  return { type: 'text' as const, text }
+export function formatTaskResult(heading: string, title: string, category: TaskCategory, reminder: TaskReminder, now: number) {
+  return [formatTaskMessage(heading, title), `${category === 'belonging' ? '必要日' : '期限'}：${formatTaskDate(reminder.dueDate, now)}`,
+    `種類：${categories[category]}`, reminderDetails(reminder, now, false)].join('\n')
 }
 
-function flexText(text: string) {
-  return { ...textMessage(text), wrap: true }
+export function formatReminderSettings(heading: string, title: string, reminder: TaskReminder, now: number) {
+  return [formatTaskMessage(heading, title), `期限：${formatTaskDate(reminder.dueDate, now)}`,
+    reminderDetails(reminder, now, true)].join('\n')
 }
 
-function button(label: string, data: string) {
-  return { type: 'button' as const, action: { type: 'postback' as const, label, data } }
+export function formatReminderDateQuery(title: string, date: string, scheduled: number[], active: boolean, now: number) {
+  const dateLabel = formatTaskDate(date, now)
+  const times = scheduled.map((at) => time.format(at)).join('・')
+  const result = times ? `${dateLabel}の設定：${times}` : `${dateLabel}に該当する通知はありません。`
+  return `${formatTaskMessage('🔔 指定日の通知設定', title)}\n${result}${active ? '' : '\n通知：停止中'}`
 }
 
-function bubble(contents: (ReturnType<typeof flexText> | ReturnType<typeof button>)[]) {
-  return { type: 'bubble' as const, body: { type: 'box' as const, layout: 'vertical' as const, spacing: 'sm', contents } }
+export function formatGroupReminderSettings(rule: ReminderRule) {
+  const summary = rule.type === 'repeat' ? formatRepeat(rule, '登録日')
+    : rule.type === 'offsets' ? formatOffsets(rule.slots)
+      : '通知：前日 20:00（期限まで8日以上あれば7日前の20:00にも通知）'
+  return `🔔 今後登録するタスクの通知設定を変更しました\n\n${summary}`
 }
 
-function flexMessage(altText: string, contents: ReturnType<typeof bubble> | { type: 'carousel'; contents: ReturnType<typeof bubble>[] }) {
-  return { type: 'flex' as const, altText, contents }
+export function formatReminderMessage(title: string, dueDate: string, slot: number) {
+  const days = daysUntil(dueDate, slot)
+  const countdown = days === 0 ? '今日が締切です' : days === 1 ? '明日が締切です'
+    : days < 0 ? `締切から${-days}日経ちました` : `締切まであと${days}日`
+  return `${formatTaskMessage('🔔 リマインダー', title)}\n期限：${formatTaskDate(dueDate, slot)}\n${countdown}`
 }
 
-export type ReplyMessage = ReturnType<typeof textMessage> | ReturnType<typeof flexMessage>
+export const helpMessage = [
+  '📖 Botの使い方',
+  'Botをメンションして、やりたいことを文章で送ってください。',
+  '📝 タスクの登録\n「12月20日までにレポート提出」',
+  '📋 タスクの確認\n「来週の締切を教えて」',
+  '✏️ タスクの変更\n「レポートの期限を12月23日に変更して」',
+  '✅ タスクの完了\n「レポート終わった」',
+  '🔔 通知の設定\n「レポートは1週間前から毎日20時に通知して」\n「レポートの通知は前日だけにして」',
+  '💬 Botへの返信\nBotのメッセージを引用すると、メンションなしで操作できます。\n「2週間前にも通知して」「もう終わった」',
+].join('\n\n')
+
+export function formatIntentError(question?: Clarification) {
+  const prompts = {
+    task: '💬 どのタスクのことですか？\nタスク名を教えてください。',
+    time: '🔔 何時に通知しましょうか？',
+    day: '🔔 何日前の通知ですか？',
+    mode: '🔔 今の通知に追加しますか？\nそれとも置き換えますか？',
+  }
+  return question ? prompts[question] : '💬 うまく読み取れませんでした。\nもう少し詳しく教えてください。'
+}

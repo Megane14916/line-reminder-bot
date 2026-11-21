@@ -1,0 +1,115 @@
+type Case = {
+  name: string
+  turns: string[]
+  date?: string
+  category?: 'belonging' | 'deadline'
+  notice?: string
+  question?: boolean
+  quoted?: boolean
+  done?: boolean
+  scoped?: boolean
+}
+
+export const deviceCases: Case[] = [
+  { name: '教科書の日付', turns: ['教科書 11/20'], date: '2026-11-20', category: 'belonging' },
+  { name: '体操服の年越し', turns: ['体操服 1/2'], date: '2027-01-02', category: 'belonging' },
+  { name: '英検の短文', turns: ['英検申し込み 11/17'], date: '2026-11-17', category: 'deadline' },
+  { name: '日付が文の途中', turns: ['教科書 明日 持ってく'], date: '2026-11-17', category: 'belonging' },
+  { name: '持参する体操服', turns: ['体操服を持っていく 1/2'], date: '2027-01-02', category: 'belonging' },
+  { name: '履歴書の短文', turns: ['履歴書書く 12/5'], date: '2026-12-05', category: 'deadline' },
+  { name: '口語の持参', turns: ['明日教科書持ってく'], date: '2026-11-17', category: 'belonging' },
+  { name: '金曜まで', turns: ['体操服、金曜まで'], date: '2026-11-20', category: 'belonging' },
+  { name: '忘れそう', turns: ['明日の物理の教科書忘れそう'], date: '2026-11-17', category: 'belonging' },
+  { name: '来週の金曜', turns: ['来週の金曜日に図工の材料を持っていく'], date: '2026-11-27', category: 'belonging' },
+  { name: '期限まで', turns: ['12/5までに履歴書を書かなくちゃ'], date: '2026-12-05', category: 'deadline' },
+  { name: '未使用の語順', turns: ['予備のコンパス、11/20に持ってく'], date: '2026-11-20', category: 'belonging' },
+  { name: '全角日付', turns: ['遠足の申込書 １２／５'], date: '2026-12-05', category: 'deadline' },
+  { name: '年月日の指定', turns: ['2027年1月2日、上履き持参'], date: '2027-01-02', category: 'belonging' },
+  { name: 'タスクに通知を付ける', turns: ['明日物理の教科書を持っていく。今日の21時に通知して'],
+    date: '2026-11-17', category: 'belonging', notice: '2026-11-16T21:00:00+09:00' },
+  { name: '翌日早朝の通知', turns: ['11/20に履歴書を提出。11/17の午前0時35分にも通知して'],
+    date: '2026-11-20', category: 'deadline', notice: '2026-11-17T00:35:00+09:00' },
+  { name: '半の時刻', turns: ['明後日までに願書を書く。今日の夜9時半に通知して'],
+    date: '2026-11-18', category: 'deadline', notice: '2026-11-16T21:30:00+09:00' },
+  { name: '明後日に修正', turns: ['教科書 11/20', 'さっきのやつ、明後日に変更'],
+    date: '2026-11-18', category: 'belonging' },
+  { name: 'あれが完了', turns: ['履歴書書く 12/5', 'あれもう終わった'], date: '2026-12-05', category: 'deadline', done: true },
+  { name: '引用で変更', turns: ['教科書 11/20', 'これは明後日に変更して'], date: '2026-11-18', category: 'belonging', quoted: true },
+  { name: '明確な雑談', turns: ['今日の晩ご飯何にしようか？'] },
+  { name: '仮定の依頼', turns: ['もし履歴書を書くなら12/5が締切って仮定で話そう'] },
+  ...['21時', '21時で', '夜9時', '21:00', '今日の21時にして', '11/16の21時に通知して', 'やっぱり21時でいい',
+    '明日持っていくものだから今日の21時'].map((answer, index) => ({
+    name: '時刻の回答 ' + answer, turns: ['明日物理の教科書を持っていくから、今日の夜通知して', answer],
+    date: '2026-11-17', category: 'belonging' as const, notice: '2026-11-16T21:00:00+09:00',
+    question: true, quoted: index === 1 || index === 5,
+  })),
+  { name: '追加してから時刻を訂正', turns: ['明日教科書持ってく', '今日の夜にも通知して', '21時', 'やっぱ20時'],
+    date: '2026-11-17', category: 'belonging', notice: '2026-11-16T20:00:00+09:00', question: true },
+  { name: '元の予定を中止', turns: ['明日物理の教科書を持っていくから、今日の夜通知して', 'やっぱなし', '21時'], question: true },
+  { name: '別のタイトルで新規登録', turns: ['明日物理の教科書を持っていくから、今日の夜通知して', '体操服 1/2', '21時'],
+    date: '2027-01-02', category: 'belonging', question: true },
+  { name: '別の人の時刻は無視', turns: ['明日物理の教科書を持っていくから、今日の夜通知して', '20時', '21時'],
+    date: '2026-11-17', category: 'belonging', notice: '2026-11-16T21:00:00+09:00', question: true, scoped: true },
+]
+
+const booksAndNight = '明日物理の教科書を持っていくから、今日の夜通知して'
+const registration = '12月14日までに英検申し込み'
+const todayAt21 = '2026-11-16T21:00:00+09:00'
+
+type ReviewCase = {
+  name: string
+  turns: { text: string; quote?: number; mention?: boolean; format?: string; legacyClock?: 'register' | 'remove-eve' | 'remove-week' }[]
+  expected: { date: string; notices?: string[] }[]
+}
+
+export const reviewCases: ReviewCase[] = [
+  { name: 'completed creation', turns: [{ text: booksAndNight, mention: true, legacyClock: 'register' },
+    { text: '11/16の21時に通知して', quote: 0,
+      format: '{"type":"create_task","title":"タスク名","category":"belonging","dueDate":"YYYY-MM-DD","rule":{"type":"offsets","slots":[],"absoluteSlots":[{"date":"YYYY-MM-DD","time":"HH:MM"}]}}' }],
+  expected: [{ date: '2026-11-17', notices: [todayAt21] }] },
+  { name: 'updated creation draft', turns: [{ text: booksAndNight, mention: true, legacyClock: 'register' },
+    { text: '夜9時で', quote: 0, format: 'type=draft, operation=create_task, fields={title,category,dueDate,notice:{kind:absolute,date,time}}' }],
+  expected: [{ date: '2026-11-17', notices: [todayAt21] }] },
+  { name: 'clock patch', turns: [{ text: booksAndNight, mention: true, legacyClock: 'register' },
+    { text: '21時', format: '{"type":"continue","fields":{"notice":{"kind":"absolute","time":"HH:MM"}}}' }],
+  expected: [{ date: '2026-11-17', notices: [todayAt21] }] },
+  { name: 'removal and addition with one missing clock', turns: [{ text: registration, mention: true },
+    { text: '前日の通知を消して、3日前の夜に通知して', mention: true, legacyClock: 'remove-eve' }, { text: '21時' }],
+  expected: [{ date: '2026-12-14', notices: ['2026-12-07T20:00:00+09:00', '2026-12-11T21:00:00+09:00'] }] },
+  { name: 'completed edit after a question', turns: [{ text: registration, mention: true },
+    { text: '前日の通知を消して、3日前の夜に通知して', mention: true, legacyClock: 'remove-eve' },
+    { text: '21時', format: '{"type":"edit_notifications","target":{"by":"recent"},"edits":[{"op":"remove","selector":{"kind":"relative","daysBefore":1}},{"op":"add","when":{"kind":"relative","daysBefore":3,"time":"HH:MM"}}]}' }],
+  expected: [{ date: '2026-12-14', notices: ['2026-12-07T20:00:00+09:00', '2026-12-11T21:00:00+09:00'] }] },
+  { name: 'keep after explicit correction', turns: [{ text: registration, mention: true },
+    { text: '7日前を消して、3日前の夜に通知して', mention: true, legacyClock: 'remove-week' }, { text: 'やっぱ7日前は消さないで。3日前は21時で' }],
+  expected: [{ date: '2026-12-14', notices: ['2026-12-07T20:00:00+09:00', '2026-12-11T21:00:00+09:00', '2026-12-13T20:00:00+09:00'] }] },
+  { name: 'new task from a quoted registration', turns: [{ text: '教科書 11/20', mention: true },
+    { text: '明日体操服持っていくから夜に通知して', quote: 0 }],
+  expected: [{ date: '2026-11-20', notices: ['2026-11-19T20:00:00+09:00'] },
+    { date: '2026-11-17', notices: ['2026-11-16T20:00:00+09:00'] }] },
+  { name: 'seven replies to the first question', turns: [{ text: booksAndNight, mention: true, legacyClock: 'register' },
+    ...Array.from({ length: 6 }, () => ({ text: 'あ、ちょっと待って', quote: 0 })), { text: '今日の21時で', quote: 0 }],
+  expected: [{ date: '2026-11-17', notices: [todayAt21] }] },
+]
+
+export const autofillCases = [
+  { name: 'registration through move and removal', turns: ['英検申し込み 12/14', '通知を全部21時にして', '3日前にも通知して',
+    'この通知を11月20日に変更して', '7日前の通知は外して'],
+  expected: ['11-20 21:00', '12-13 21:00'] },
+  { name: 'addition without also', seed: [20, 20], turns: ['英検申し込みは3日前に通知して'],
+    expected: ['12-07 20:00', '12-11 20:00', '12-13 20:00'] },
+  { name: 'majority', seed: [9, 20, 20], turns: ['英検申し込みは3日前にも通知を増やして'],
+    expected: ['11-30 09:00', '12-07 20:00', '12-11 20:00', '12-13 20:00'] },
+  { name: 'preserve moved clock', seed: [9, 20, 20], turns: ['英検申し込みの14日前の通知を11/20に移して'],
+    expected: ['11-20 09:00', '12-07 20:00', '12-13 20:00'] },
+  { name: 'remove a whole date', seed: [8, 20, 20], duplicateDay: true, turns: ['英検申し込みは7日前を省いて'],
+    expected: ['12-13 20:00'] },
+  { name: 'morning default', seed: [20, 20], turns: ['英検申し込みは明日の朝に通知して'],
+    expected: ['11-17 08:00', '12-07 20:00', '12-13 20:00'] },
+  { name: 'evening default', seed: [9, 9], turns: ['英検申し込みは3日前の夕方にも知らせて'],
+    expected: ['12-07 09:00', '12-11 18:00', '12-13 09:00'] },
+  { name: 'usual time', seed: [21, 21], turns: ['英検申し込みは2日前にもいつもの時間で通知して'],
+    expected: ['12-07 21:00', '12-12 21:00', '12-13 21:00'] },
+  { name: 'no unauthorized deletion', seed: [20, 20], other: true, turns: ['通知は外して'],
+    expected: ['12-07 20:00', '12-13 20:00'], question: true },
+] as const
