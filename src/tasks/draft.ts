@@ -8,6 +8,32 @@ import { namesTarget } from './target-matching'
 import { todayInJapan } from './validation'
 import { draftEdits, justifiedRemovals, nextEditQuestion, reconcileEditedDraft } from './draft-edits'
 
+export function shortBelongingRegistration(text: string, now: number): TaskAction | undefined {
+  const value = text.normalize('NFKC').trim()
+  const match = /^([\p{L}\p{N}ー]{0,30}(?:教科書|体操服|上履き|水筒|ノート|筆箱|辞書))\s+((?:\d{4}[/年-])?\d{1,2}[/月-]\d{1,2}日?)$/u.exec(value)
+  if (!match) return
+  const [day] = explicitNotificationDates(match[2], now)
+  if (!day?.date) return { type: 'clarify', question: 'day' }
+  return { type: 'create_task', title: match[1], category: 'belonging', dueDate: day.date }
+}
+
+function registrationCalendar(text: string, now: number) {
+  const value = text.normalize('NFKC')
+  const dates = explicitNotificationDates(value, now)
+  if (dates.length !== 2 || dates.some(({ date }) => !date) || relativeDays(value).length || /毎日|毎週|日おき/.test(value)) return
+  const roles = dates.map((date, index) => {
+    const end = dates[index + 1]?.index
+    const phrase = value.slice(date.end, end)
+    return { ...date, text: value.slice(date.index, end), notify: /通知|知らせ|リマインド/.test(phrase),
+      task: /持ってい|持ってく|持参|提出|締切|期限|まで|予定|申込|申し込|テスト|宿題/.test(phrase) }
+  })
+  const due = roles.find((role) => role.task && !role.notify)
+  const notify = roles.find((role) => role.notify && !role.task)
+  if (!due?.date || !notify?.date || due.date === notify.date) return
+  return { dueDate: due.date, notice: { kind: 'absolute' as const, date: notify.date, time: notify.time }, dueTime: due.time,
+    period: notificationPeriod(notify.text, now) }
+}
+
 type Evidence = NonNullable<PendingDialogue['evidence']>
 type DraftResult = { action: TaskAction; change?: NotificationChange } | { pending: PendingDialogue } | { error: string }
 type Continuation = { type?: 'continue' | 'draft'; fields: TaskDraft['fields']; patches?: DraftEditPatch[] }
@@ -102,6 +128,14 @@ export function resolveDraft(draft: TaskDraft, original: string, originalAt: num
   const originalEvidence = dateTimeEvidence(original, originalAt)
   const answer = dateTimeEvidence(text, now)
   const fields = { ...draft.fields }
+  const calendar = draft.operation === 'create_task' ? registrationCalendar(original, originalAt) : undefined
+  if (calendar) {
+    if (!previous) {
+      fields.dueDate = calendar.dueDate
+      fields.notice = calendar.notice
+    }
+    originalEvidence.times = originalEvidence.times.filter((time) => time !== calendar.dueTime || time === calendar.notice.time)
+  }
   const editText = draft.operation === 'edit_notifications' ? previous?.editText ?? original : undefined
   if (draft.operation === 'edit_notifications') {
     fields.edits = draftEdits(fields)
@@ -126,10 +160,11 @@ export function resolveDraft(draft: TaskDraft, original: string, originalAt: num
   const replacedTime = oldTime && fields.notice?.time !== oldTime ? oldTime : undefined
   const evidence: Evidence = {
     dates: [...new Set([...(previous?.evidence?.dates ?? originalEvidence.dates).filter((date) => !replacedDates.includes(date)), ...answer.dates])],
-    times: [...new Set([...(previous?.evidence?.times ?? originalEvidence.times).filter((time) => time !== replacedTime), ...answer.times])],
+    times: [...new Set([...(previous?.evidence?.times ?? originalEvidence.times).filter((time) => time !== replacedTime),
+      ...(previous || text !== original ? answer.times : originalEvidence.times)])],
   }
   const pending = (question: PendingDialogue['question'], prompt: string): DraftResult =>
-    ({ pending: { question, prompt, draft: { ...draft, fields }, originalAt, evidence, editText, observedTask: previous?.observedTask } })
+    ({ pending: { question, prompt, draft: { ...draft, fields }, originalAt, original, evidence, editText, observedTask: previous?.observedTask } })
   if (answer.invalidDay) return pending('day', '📅 日付を確認して、もう一度教えてください。')
   if (answer.invalidTime) return pending('time', '🔔 時刻を確認して、もう一度教えてください。')
   if (draft.operation === 'create_task') {
@@ -161,9 +196,10 @@ export function resolveDraft(draft: TaskDraft, original: string, originalAt: num
       notice = { ...notice, time: answer.times[0] }
       fields.notice = notice
     }
+    const originalPeriod = calendar ? calendar.period : notificationPeriod(original, originalAt)
     const { time, timeSource } = resolveNotificationClock({ dueDate: fields.dueDate!, anchor: now, groupRule,
       explicit: notice.time && evidence.times.includes(notice.time) ? notice.time : undefined,
-      period: notificationPeriod(text, now) ?? notificationPeriod(original, originalAt) })
+      period: (previous ? notificationPeriod(text, now) : undefined) ?? originalPeriod })
     notice = { ...notice, time }
     change = { resolvedTime: time, timeSource }
     if (notice.kind === 'absolute' && notice.date && absoluteTime({ date: notice.date, time }) <= now) {
@@ -210,6 +246,11 @@ function specifiesNotice(text: string, evidence: ReturnType<typeof dateTimeEvide
 
 // An addition or clock proposal can be grounded in the calendar evidence of the current turn.
 export function groundTemporalDraft(action: TaskAction, text: string, now: number, pending?: PendingDialogue): DialogueProposal | undefined {
+  if (action.type === 'create_task' && !pending) {
+    const calendar = registrationCalendar(text, now)
+    if (calendar) return { type: 'draft', operation: 'create_task', fields: { title: action.title, category: action.category,
+      dueDate: calendar.dueDate, notice: calendar.notice } }
+  }
   if (action.type === 'create_task' && !pending &&
     explicitNotificationDates(text, now).every(({ date }) => !date || date !== action.dueDate &&
       action.rule && absoluteReminders(action.rule).some((slot) => slot.date === date)) &&

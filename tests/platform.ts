@@ -8,12 +8,13 @@ import outbox from '../migrations/0006_operation_result_outbox.sql?raw'
 import quoteContext from '../migrations/0007_bot_message_context.sql?raw'
 import conversation from '../migrations/0008_task_conversation.sql?raw'
 import dialogue from '../migrations/0009_dialogue_threads.sql?raw'
+import threadHistory from '../migrations/0010_thread_history.sql?raw'
 
 export async function testPlatform() {
   const platform = await getPlatformProxy<Env>({ persist: false, remoteBindings: false, envFiles: [] })
   const { DB } = platform.env
   try {
-    for (const migration of [initial, batches, retries, natural, inbox, outbox, quoteContext, conversation, dialogue]) {
+    for (const migration of [initial, batches, retries, natural, inbox, outbox, quoteContext, conversation, dialogue, threadHistory]) {
       await DB.batch(unstable_splitSqlQuery(migration).map((sql) => DB.prepare(sql)))
     }
     return platform

@@ -25,7 +25,7 @@ export function saveOperationResult(db: D1Database, receiptId: number, message: 
       min(received_at + 50000, event_time + 1190000), ?,
       CASE WHEN ? THEN 'push_pending' ELSE 'reply_pending' END, ?, ?,
       CASE WHEN ? AND changes() = 1 THEN (SELECT task_id FROM task_contexts WHERE group_id = q.group_id AND user_id = q.user_id) END,
-      ${typeof message === 'string' ? '?' : 'CASE WHEN changes() = 1 THEN ? END'}, ?, ?
+      ?, ?, ?
     FROM webhook_inbox q WHERE receipt_id = ?`)
     .bind(...(typeof message === 'string' ? [message] : [message.changed, message.unchanged]),
       Number(forcePush), crypto.randomUUID(), Number(forcePush), now, now + retentionMs, Number(linkTask), threadId ?? null, Number(question),

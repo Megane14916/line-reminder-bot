@@ -6,7 +6,7 @@ import { applyEvent, findTasks, finishInboxEvent, getBotMessage, getContext, get
 import { conversationHistory, notificationFocus } from '../tasks/conversation'
 import { getDialogue, type Dialogue } from '../tasks/dialogue'
 import { continuationFields, dateTimeEvidence, groundedTitle, groundTemporalDraft, hasDifferentQuotedSubject, reconcileDraft,
-  resolveDraft, validateCreation } from '../tasks/draft'
+  resolveDraft, shortBelongingRegistration, validateCreation } from '../tasks/draft'
 import { clockReasonRequest, explicitNotificationDates, explicitNotificationTimes, literalNotificationEdits, notificationDateQuery,
   notificationPeriod, refersToQuotedNotification, relativeDays, simpleNotificationEdit, undoAdditionRequest, validateNotificationIntent } from '../tasks/notification-dates'
 import { reminderSlots, ruleSchema } from '../tasks/schedule'
@@ -18,7 +18,7 @@ import { formatIntentError, helpMessage } from './messages'
 import { drainResults, expiredOperationResults, failedInference, unknownOperation } from './outbox'
 
 export type Input = ({ type: 'intent' | 'followup'; text: string } |
-  { type: 'quote'; messageId: string; text?: string; mentioned?: boolean } | { type: 'selection'; id: number }) & { sourceMessageId?: string }
+  { type: 'quote'; messageId: string; text?: string; mentioned?: boolean } | { type: 'selection'; id: number; messageId?: string }) & { sourceMessageId?: string }
 export type Operation = Omit<TaskEvent, 'now' | 'inbox'> & { replyToken: string; input: Input }
 type Entry = { receipt_id: number; group_id: string }
 type Claimed = Entry & {
@@ -42,10 +42,11 @@ export async function acceptEvents(db: D1Database, operations: Operation[], now:
       let guard = ''
       let bindings: (string | number)[] = []
       if (input.type === 'quote' && !input.mentioned) {
-        guard = `AND EXISTS (SELECT 1 FROM (${sentMessage}) msg WHERE msg.thread_question = 0 OR EXISTS (
+        guard = `AND EXISTS (SELECT 1 FROM (${sentMessage}) msg WHERE (msg.owner_id IS NULL OR msg.owner_id = ?)
+          AND (msg.thread_id IS NULL OR EXISTS (
           SELECT 1 FROM dialogue_threads d WHERE d.id = msg.thread_id AND d.group_id = ? AND d.user_id = ?
-            AND d.pending_json IS NOT NULL AND d.expires_at > ? AND d.updated_at <= ?))`
-        bindings = [groupId, input.messageId, groupId, input.messageId, groupId, userId, now, eventTime]
+            AND (msg.thread_question = 0 OR d.pending_json IS NOT NULL) AND d.expires_at > ? AND d.updated_at <= ?)))`
+        bindings = [groupId, input.messageId, groupId, input.messageId, userId, groupId, userId, now, eventTime]
       } else if (input.type === 'followup') {
         const questions = JSON.stringify(followupQuestions(input.text, eventTime))
         const matchingTaskAnswer = `(json_extract(pending_json, '$.question') = 'task' AND EXISTS (
@@ -130,6 +131,8 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
   const { clock } = budget
   const input: Input = JSON.parse(row.input_json)
   event.messageId = input.sourceMessageId
+  const independent = input.type === 'intent' || input.type === 'quote' && input.mentioned
+  event.utterance = input.type === 'selection' ? '#' + input.id : input.text ?? '完了'
   try {
     const stale = await db.prepare(`SELECT 1 AS stale FROM webhook_group_progress WHERE group_id = ?
       AND (event_time, receipt_id) > (?, ?)`).bind(event.groupId, event.eventTime, row.receipt_id).first()
@@ -144,32 +147,48 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
     let reply: string | undefined
     let failure: string | undefined
     if (input.type === 'selection') {
-      reply = await answerSelection(db, event, input.id)
-    } else if ((input.type === 'intent' || input.type === 'quote' && input.mentioned) && !input.text) {
+      const quote = input.messageId ? await getBotMessage(db, event.groupId, input.messageId) : undefined
+      const thread = quote?.thread_id && quote.turn_json && JSON.parse(quote.turn_json).operation === 'selection'
+        ? await getDialogue(db, event, quote.thread_id)
+        : input.messageId ? null : await getDialogue(db, event)
+      if (thread?.selection || thread === undefined && !input.messageId) {
+        event.thread = thread ?? undefined
+        reply = await answerSelection(db, event, input.id)
+      } else if (thread === null && !input.messageId) {
+        reply = '💬 操作したい候補一覧を引用し、#付きの番号を送ってください。'
+      }
+    } else if (independent && !input.text) {
+      event.thread = { id: event.eventId, original: '', taskId: null }
       reply = helpMessage
     } else {
-      const quote = input.type === 'quote' ? await getBotMessage(db, event.groupId, input.messageId) : null
+      const quote = input.type === 'quote' && !independent ? await getBotMessage(db, event.groupId, input.messageId) : null
       const text = input.text ?? '完了'
-      const [context, stored] = await Promise.all([getContext(db, event),
-        quote ? quote.thread_id ? getDialogue(db, event, quote.thread_id) : undefined : getDialogue(db, event)])
+      const [context, stored] = await Promise.all([
+        input.type === 'followup' ? getContext(db, event) : null,
+        quote?.thread_id ? getDialogue(db, event, quote.thread_id) : input.type === 'followup' ? getDialogue(db, event) : undefined,
+      ])
       const old = pendingContext(context)
-      const legacy = !stored && !quote && old?.kind === 'clarification' ? old : undefined
-      const pending = stored?.pending ?? (legacy ? {
-        question: legacy.question, prompt: formatIntentError(legacy.question), originalAt: event.eventTime, quotedAt: legacy.quotedAt,
-      } : undefined)
-      const original = pending ? stored?.original ?? legacy?.text : undefined
-      if ((input.type === 'followup' && !pending) || (input.type === 'quote' && !quote && !input.mentioned)
-        || (quote?.thread_question && !stored?.pending)
-        || (quote && /^(?:ありがとう(?:ございます)?|了解(?:です)?|OK)[。！!]*$/i.test(text))) {
+      const legacy = stored === undefined && !quote && old?.kind === 'clarification' ? old : undefined
+      const pending = stored?.pending ? { ...stored.pending, original: stored.pending.original ?? stored.original }
+        : legacy ? { question: legacy.question, prompt: formatIntentError(legacy.question), originalAt: event.eventTime,
+          original: legacy.text, quotedAt: legacy.quotedAt } : undefined
+      const original = pending?.original
+      if ((input.type === 'followup' && !pending) || (input.type === 'quote' && !independent &&
+        (!quote || quote.owner_id && quote.owner_id !== event.userId || quote.thread_id && !stored))
+        || (quote?.thread_question && !stored?.pending)) {
         await finishInboxEvent(db, { ...event, now: clock() }, false)
         return
       }
-      const newThread: Dialogue = { id: event.eventId, original: legacy?.text ?? text, taskId: quote ? quote.task_id : null }
-      event.thread = stored ?? newThread
+      const newThread: Dialogue = { id: event.eventId, original: legacy?.text ?? text, taskId: quote?.task_id ?? context?.task_id ?? null }
+      const thread = stored ?? newThread
+      event.thread = thread
       event.startsThread = !stored
+      if (quote && /^(?:ありがとう(?:ございます)?|了解(?:です)?|OK)[。！!]*$/i.test(text)) {
+        await finishInboxEvent(db, { ...event, now: clock() }, false)
+        return
+      }
       const startRegistrationThread = () => {
-        event.thread = { id: event.eventId, original: text, taskId: null }
-        event.startsThread = true
+        event.thread = { id: thread.id, original: thread.original, taskId: null }
         event.quoteTaskId = undefined
         event.quotedAt = undefined
         event.observedTask = undefined
@@ -179,8 +198,8 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
       event.quotedTurn = quote?.turn_json ? JSON.parse(quote.turn_json) : undefined
       if (quote && quote.task_id === null && !stored?.taskId) event.quoteTaskId = null
       event.quotedAt = quote?.scheduled_at ?? pending?.quotedAt ?? (quote ? null : undefined)
-      const contextualId = event.quoteTaskId === undefined ? stored?.taskId ?? context?.task_id : event.quoteTaskId
-      const [history, named] = await Promise.all([conversationHistory(db, event),
+      const contextualId = event.quoteTaskId === undefined ? event.thread.taskId : event.quoteTaskId
+      const [history, named] = await Promise.all([stored ? conversationHistory(db, event, stored.id) : [],
         quote || stored?.pending ? undefined : mentionedTask(db, event.groupId, text)])
       event.history = history
       event.explicitTaskId = named?.id
@@ -196,6 +215,7 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
       const correction = /^(?:やっぱり?|いや[、,]?)\s*(?:朝|夜|午前|午後)?\s*\d{1,2}(?::\d{2}|時(?:半|\d{1,2}分)?)(?:で(?:いい)?|にして)?[。！!]*$/.test(text.normalize('NFKC'))
       const correctRecentNotice = Boolean(focus && !focus.before && focus.after &&
         correction)
+      const shortRegistration = independent ? shortBelongingRegistration(text, event.eventTime) : undefined
       if (quotedChange?.after && contextualTask && event.quotedTurn?.version !== contextualTask.reminder_version &&
         (correction || refersToQuotedNotification(text) || undoAdditionRequest.test(text.trim().replace(/[。！!]+$/, '')))) {
         await finishInboxEvent(db, { ...event, now: clock() }, false,
@@ -233,6 +253,8 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
           event.turn = saved.turn
         }
         action = intentSchema.parse(saved.action ?? saved)
+      } else if (shortRegistration) {
+        action = shortRegistration
       } else if (!pending && notificationDateQuery(text, event.eventTime, false)) {
         action = { type: 'get_reminder', target: contextualTask ? { by: 'id', id: contextualTask.id } : { by: 'recent' } }
       } else if (!pending && clockReasonRequest.test(text)) {
@@ -250,7 +272,7 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
         const timeout = Math.min(aiTimeout(env), budget.remaining() - 3000)
         if (timeout <= 0) return
         const parsed = await parseIntent(configuredInference(env, row.last_error), event.text, event.eventTime, timeout, {
-          quoted: !!quote, question: pending?.question, pending, original: stored?.original ?? original,
+          quoted: !!quote, question: pending?.question, pending, original: original ?? stored?.original,
           followup: input.type === 'followup' || Boolean(quote?.thread_question),
           recentConversation: history.length ? history : undefined,
           task: contextualTask && rule ? { id: contextualTask.id, title: contextualTask.title, dueDate: contextualTask.due_date,
@@ -281,7 +303,7 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
         if (!registrationTitle && contextualTask && quote?.task_id === contextualTask.id &&
           hasDifferentQuotedSubject(text, contextualTask.title, event.eventTime) &&
           (dialogue?.type === 'draft' || parsed.kind === 'parsed' && 'target' in parsed.action)) {
-          await finishInboxEvent(db, { ...event, thread: undefined, now: clock() }, false, '💬 新しいタスクの登録ですか？ 引用したタスクの変更ですか？')
+          await finishInboxEvent(db, { ...event, now: clock() }, false, '💬 新しいタスクの登録ですか？ 引用したタスクの変更ですか？')
           return
         }
         const repeatQuestion = async () => {
@@ -396,10 +418,6 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
             const candidates = await findTasks(db, event.groupId, text.trim(), undefined, proposal.type === 'restore_task')
             if (candidates?.some(({ title }) => title === text.trim())) proposal = { ...proposal, target: { by: 'name', name: text.trim() } }
           }
-          if (pending && !continuing && proposal.type !== 'clarify' && proposal.type !== 'unknown') {
-            event.thread = newThread
-            event.startsThread = true
-          }
           if (proposal.type === 'create_task' && (!pending || newRegistration)) startRegistrationThread()
           if (continuing && original) event.text = original + '\n補足：' + text
           if (proposal.type !== 'clarify' && proposal.type !== 'unknown') event.interpretedAction = proposal
@@ -454,7 +472,7 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
     if (!event.inbox.canCommit()) return
     event.now = clock()
     if (action) {
-      event.turn = { operation: action.type }
+      event.turn ??= { operation: action.type }
       event.interpretedAction = action
       reply = await dispatchAction(db, event, action)
     }

@@ -6,7 +6,7 @@ import type { Daypart } from './notification-clock'
 
 const day = 86_400_000
 const weekdays = '日月火水木金土'
-const clockPattern = /(?:(午前|午後|朝|夜)\s*)?(\d{1,2})(?::(\d{2})|時(?:\s*(\d{1,2})分|(半))?)/g
+const clockPattern = /(?:(午前|午後|朝|夜)\s*(?:の\s*)?)?(\d{1,2})(?::(\d{2})|時(?:\s*(\d{1,2})分|(半))?)/g
 function clocks(text: string) {
   return [...text.matchAll(clockPattern)].map((match) => {
     const period = match[1]
@@ -68,7 +68,8 @@ export function explicitNotificationDates(text: string, now: number) {
   }
   return dates.sort((a, b) => a.index - b.index).map((date) => ({
     ...date,
-    time: clock.find((time) => time.index >= date.end && /^[\sの、]*$/.test(normalized.slice(date.end, time.index)))?.time,
+    time: clock.find((time) => time.index === date.end - 1 && /今[朝夜]/.test(normalized.slice(date.index, date.end)) ||
+      time.index >= date.end && /^[\sの、]*$/.test(normalized.slice(date.end, time.index)))?.time,
   }))
 }
 

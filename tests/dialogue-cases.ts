@@ -46,7 +46,7 @@ export const deviceCases: Case[] = [
   { name: '追加してから時刻を訂正', turns: ['明日教科書持ってく', '今日の夜にも通知して', '21時', 'やっぱ20時'],
     date: '2026-11-17', category: 'belonging', notice: '2026-11-16T20:00:00+09:00', question: true },
   { name: '元の予定を中止', turns: ['明日物理の教科書を持っていくから、今日の夜通知して', 'やっぱなし', '21時'], question: true },
-  { name: '別のタイトルで新規登録', turns: ['明日物理の教科書を持っていくから、今日の夜通知して', '体操服 1/2', '21時'],
+  { name: '別のメンションで新規登録', turns: ['明日物理の教科書を持っていくから、今日の夜通知して', '体操服 1/2'],
     date: '2027-01-02', category: 'belonging', question: true },
   { name: '別の人の時刻は無視', turns: ['明日物理の教科書を持っていくから、今日の夜通知して', '20時', '21時'],
     date: '2026-11-17', category: 'belonging', notice: '2026-11-16T21:00:00+09:00', question: true, scoped: true },
