@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test, vi 
 import { getPlatformProxy } from 'wrangler'
 import worker, { app } from '../src/index'
 import { parseIntent } from '../src/line/intent-parser'
+import { workersAiInference } from '../src/line/intent-inference'
 import { literalNotificationEdits } from '../src/tasks/notification-dates'
 import { dateTimeEvidence } from '../src/tasks/draft'
 import { acceptEvents, drainInbox } from '../src/line/inbox'
@@ -42,7 +43,7 @@ function webhookEnv() {
   return { ...platform.env, LINE_CHANNEL_SECRET: secret, LINE_CHANNEL_ACCESS_TOKEN: 'test-token', AI: ai, AI_MODEL: model } as const
 }
 
-async function webhook(events: unknown[], options: { raw?: string; tampered?: boolean; missing?: boolean; work?: Promise<unknown>[] } = {}) {
+async function webhook(events: unknown[], options: { raw?: string; tampered?: boolean; missing?: boolean; work?: Promise<unknown>[]; env?: Env } = {}) {
   const body = options.raw ?? JSON.stringify({ events })
   const encoder = new TextEncoder()
   const key = await crypto.subtle.importKey('raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
@@ -52,7 +53,7 @@ async function webhook(events: unknown[], options: { raw?: string; tampered?: bo
   const response = await app.request('/webhook/line', {
     method: 'POST', body: options.tampered ? body + '\\n' : body,
     headers: options.missing ? {} : { 'x-line-signature': signature },
-  }, webhookEnv(),
+  }, options.env ?? webhookEnv(),
   { waitUntil: (promise) => { work.push(promise) }, passThroughOnException: vi.fn(), props: {} })
   if (!options.work) await Promise.all(work)
   return response
@@ -257,11 +258,11 @@ function pushes() {
   }))
 }
 
-function tick(time: number) {
+function tick(time: number, env: Env = webhookEnv()) {
   vi.mocked(Date.now).mockReturnValue(time)
   const budget = runtimeBudget()
   return withinBudget(budget, async () => {
-    await Promise.all([drainInbox(webhookEnv(), budget), drainResults(webhookEnv(), budget)])
+    await Promise.all([drainInbox(env, budget), drainResults(env, budget)])
   })
 }
 
@@ -690,7 +691,7 @@ test.each([
 
 test('queues a retry on inference failures and classifies inference timeout', async () => {
   infer.mockImplementationOnce(() => new Promise(() => {}))
-  await expect(parseIntent(ai, model, '今日の締切', now, 5)).resolves.toEqual({ kind: 'timeout' })
+  await expect(parseIntent(workersAiInference(ai, model), '今日の締切', now, 5)).resolves.toEqual({ kind: 'timeout' })
   expect(infer.mock.calls[0][2].signal.aborted).toBe(true)
   infer.mockRejectedValueOnce(new Error('network failed'))
   const query = event('今日の締切', { mention: true })
@@ -701,6 +702,97 @@ test('queues a retry on inference failures and classifies inference timeout', as
   await tick(now + 15_000)
   expect(await inbox(query.webhookEventId)).toMatchObject({ status: 'succeeded', attempts: 2 })
   expect(lastReply()).toContain('該当するタスクはありません')
+})
+
+const geminiUrl = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent'
+
+function mockGemini(action: unknown, finishReason = 'STOP') {
+  line.mockImplementation(async (url) => String(url) === geminiUrl
+    ? Response.json({ candidates: [{ finishReason, content: { parts: [{ text: JSON.stringify(action) }] } }] })
+    : new Response('{}'))
+}
+
+test('registers via Gemini by default when the key is configured', async () => {
+  const text = 'レポートを登録 12/20'
+  const env = { ...webhookEnv(), GEMINI_API_KEY: 'test-gemini-key' }
+  mockGemini(create)
+
+  expect((await webhook([event(text, { mention: true })], { env })).status).toBe(200)
+
+  expect(infer).not.toHaveBeenCalled()
+  const geminiRequests = line.mock.calls.filter(([url]) => url === geminiUrl)
+  expect(geminiRequests).toHaveLength(1)
+  const [, init] = geminiRequests[0]
+  expect(init?.redirect).toBe('manual')
+  expect(new Headers(init?.headers).get('x-goog-api-key')).toBe('test-gemini-key')
+  expect(JSON.parse(String(init?.body))).toMatchObject({
+    systemInstruction: { parts: [{ text: expect.stringContaining('日本時間の今日は 2030-12-01') }] },
+    contents: [{ role: 'user', parts: [
+      { text: expect.stringContaining('"calendarEvidence":[{"date":"2030-12-20"}]') }, { text },
+    ] }],
+    generationConfig: { responseMimeType: 'application/json', maxOutputTokens: 1024 },
+  })
+  expect((await taskRows()).results).toMatchObject([{ title: create.title, due_date: create.dueDate }])
+  expect(lastReply()).toContain(create.title)
+})
+
+test('registers via Workers AI when Gemini returns a quota error', async () => {
+  const env = { ...webhookEnv(), GEMINI_API_KEY: 'test-gemini-key' }
+  const request = event('レポートを登録 12/20', { mention: true })
+  line.mockImplementation(async (url) => String(url) === geminiUrl ? new Response(null, { status: 429 }) : new Response('{}'))
+  infer.mockResolvedValueOnce({ response: create })
+
+  await webhook([request], { env })
+
+  expect(line.mock.calls[0][0]).toBe(geminiUrl)
+  expect(line.mock.invocationCallOrder[0]).toBeLessThan(infer.mock.invocationCallOrder[0])
+  expect(infer).toHaveBeenCalledOnce()
+  expect(await inbox(request.webhookEventId)).toMatchObject({ status: 'succeeded', attempts: 1 })
+  expect((await taskRows()).results).toMatchObject([{ title: create.title, due_date: create.dueDate }])
+  expect(lastReply()).toContain(create.title)
+})
+
+test('uses Workers AI on the Inbox retry after Gemini times out', async () => {
+  const env = { ...webhookEnv(), GEMINI_API_KEY: 'test-gemini-key' }
+  const request = event('レポートを登録 12/20', { mention: true })
+  const started = Promise.withResolvers<void>()
+  const work: Promise<unknown>[] = []
+  line.mockImplementation(async (url) => {
+    if (String(url) !== geminiUrl) return new Response('{}')
+    started.resolve()
+    return new Promise(() => {})
+  })
+  infer.mockResolvedValueOnce({ response: create })
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+  try {
+    await webhook([request], { env, work })
+    await started.promise
+    await vi.advanceTimersByTimeAsync(12_000)
+    await Promise.all(work)
+  } finally {
+    vi.useRealTimers()
+  }
+  expect(line).toHaveBeenCalledOnce()
+  expect(line.mock.calls[0][1]?.signal?.aborted).toBe(true)
+  expect(infer).not.toHaveBeenCalled()
+  expect(await inbox(request.webhookEventId)).toMatchObject({ status: 'queued', last_error: 'ai_timeout' })
+
+  await tick(now + 15_000, env)
+  expect(infer).toHaveBeenCalledOnce()
+  expect(line.mock.calls.filter(([url]) => url === geminiUrl)).toHaveLength(1)
+  expect(await inbox(request.webhookEventId)).toMatchObject({ status: 'succeeded', attempts: 2 })
+  expect((await taskRows()).results).toMatchObject([{ title: create.title, due_date: create.dueDate }])
+})
+
+test('discards a Gemini response with an unfinished candidate', async () => {
+  const env = { ...webhookEnv(), GEMINI_API_KEY: 'test-gemini-key' }
+  const request = event('レポートを登録 12/20', { mention: true })
+  mockGemini(create, 'MAX_TOKENS')
+
+  await webhook([request], { env })
+  expect(infer).not.toHaveBeenCalled()
+  expect((await taskRows()).results).toEqual([])
+  expect(await inbox(request.webhookEventId)).toMatchObject({ status: 'failed', last_error: 'invalid_intent' })
 })
 
 test.each(['終わった', '完了', '✅'])('quotes an accepted push to complete once and stop future notices (%s)', async (text) => {

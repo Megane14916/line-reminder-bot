@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest'
 import { getPlatformProxy } from 'wrangler'
 import { authorizeIntent } from '../src/line/inbox'
 import { parseIntent, type IntentContext } from '../src/line/intent-parser'
+import { geminiInference, workersAiInference, type IntentInference } from '../src/line/intent-inference'
 import type { TaskAction } from '../src/tasks/intent'
 import { namesTarget } from '../src/tasks/target-matching'
 import { applyNotificationPlan } from '../src/tasks/notification-plan'
@@ -26,14 +27,14 @@ function planOutcome(action: Extract<TaskAction, { type: 'edit_notifications' }>
     added: changes.flatMap((change) => change.after ? [JSON.stringify({ slot: change.after, source: change.timeSource })] : []).sort() }
 }
 
-async function checkIntent(ai: Ai, fixture: IntentFixture, useLiteral = false) {
+async function checkIntent(infer: IntentInference, fixture: IntentFixture, useLiteral = false) {
   const rule = fixture.rule ?? defaultRule
   const context: IntentContext = { quoted: fixture.quoted ?? false, task: { ...task, id: 12, status: 'open',
     reminderEnabled: fixture.enabled ?? true, rule, upcoming: reminderSlots(rule, task.dueDate, now, now, 4).map((at) => new Date(at).toISOString()),
     version: 2, focus: fixture.focus } }
   const literal = useLiteral ? literalNotificationEdits(fixture.text, now) : undefined
   const parsed = literal ? { kind: 'parsed' as const, action: { type: 'edit_notifications' as const,
-    target: { by: 'recent' as const }, edits: literal } } : await parseIntent(ai, model, fixture.text, now, undefined, context)
+    target: { by: 'recent' as const }, edits: literal } } : await parseIntent(infer, fixture.text, now, undefined, context)
   expect(parsed.kind).toBe('parsed')
   if (parsed.kind !== 'parsed') return
   const action = literal ? parsed.action : authorizeIntent(parsed.action, fixture.text, context.quoted, now)
@@ -57,7 +58,7 @@ async function checkIntent(ai: Ai, fixture: IntentFixture, useLiteral = false) {
 
 test.each(cases)('validates and authorizes a structured mock Intent for $text', async (fixture) => {
   const run = vi.fn().mockResolvedValue({ response: JSON.stringify(fixture.action) })
-  await checkIntent({ run } as unknown as Ai, fixture)
+  await checkIntent(workersAiInference({ run } as unknown as Ai, model), fixture)
   expect(run.mock.calls[0][1].messages[0].content).toContain('同じタスクに対する変更')
   expect(run.mock.calls[0][1]).toMatchObject({
     reasoning_effort: 'low', chat_template_kwargs: { enable_thinking: false },
@@ -106,5 +107,17 @@ describe.runIf(env.RUN_REAL_INTENT_EVAL === '1')('Workers AI (real model)', () =
   }, 30_000)
 
   afterAll(async () => { await platform?.dispose() })
-  test.each(cases)('$text', async (fixture) => await checkIntent(ai, fixture, env.MODEL_ONLY_INTENT_EVAL !== '1'), 15_000)
+  test.each(cases)('$text', async (fixture) => await checkIntent(workersAiInference(ai, model), fixture, env.MODEL_ONLY_INTENT_EVAL !== '1'), 15_000)
+})
+
+describe.runIf(env.RUN_REAL_GEMINI_EVAL === '1')('Gemini API (real model)', () => {
+  let infer: IntentInference
+
+  beforeAll(() => {
+    const apiKey = env.GEMINI_API_KEY?.trim()
+    if (!apiKey) throw new Error('Set GEMINI_API_KEY to run the Gemini evaluation')
+    infer = geminiInference(apiKey, env.GEMINI_MODEL ?? 'gemini-3.5-flash-lite')
+  })
+
+  test.each(cases)('$text', async (fixture) => await checkIntent(infer, fixture, env.MODEL_ONLY_INTENT_EVAL !== '1'), 15_000)
 })

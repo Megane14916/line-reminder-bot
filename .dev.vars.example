@@ -1,2 +1,4 @@
 LINE_CHANNEL_SECRET=example-channel-secret
 LINE_CHANNEL_ACCESS_TOKEN=example-channel-access-token
+# .dev.vars.gemini では Gemini API キーも設定する
+# GEMINI_API_KEY=

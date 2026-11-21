@@ -68,7 +68,7 @@ npm.cmd run dev
 
 `GET /health` と `POST /webhook/line` が公開ルートです。LINE 実機確認ではテスト用チャネルの `LINE_CHANNEL_SECRET` と `LINE_CHANNEL_ACCESS_TOKEN` を、Git 管理外の `.dev.vars` に設定します。テスト用 HTTPS URL の末尾に `/webhook/line` を付けて LINE Developers で登録・検証し、Webhook とグループ参加を有効にします。標準の自動応答は LINE Official Account Manager でオフにしてください。
 
-ローカル Cron は公開トンネルを停止した状態で `npm.cmd run dev -- --test-scheduled` を起動し、通知予定時刻に以下を実行します。テスト用グループ・チャネルとローカル D1 を使用してください。
+ローカル Cron を試すには、公開トンネルを停止し、タスクを登録した環境を `--test-scheduled` 付きで起動します。通常環境では `npm.cmd run dev -- --test-scheduled` を使います。通知予定時刻になったら、起動ログの `Ready on` に出たポートで以下を実行します。テスト用グループ・チャネルとローカル D1 を使用してください。
 
 ```powershell
 Invoke-RestMethod 'http://localhost:8787/cdn-cgi/local/scheduled?cron=*+*+*+*+*&format=json'
@@ -77,7 +77,7 @@ npm.cmd test
 npx.cmd wrangler deploy --dry-run
 ```
 
-テストはモック AI・LINE API とローカル D1 を使います。ローカル Worker で実際にメンション操作をすると Workers AI のリモート推論が必要です。
+テストはモック AI・LINE API とローカル D1 を使います。設定済みの Gemini キーで試す場合は以下の試用環境を使います。
 
 Workers AI を利用できるアカウントで Wrangler にログインすると、合成した会話シナリオで単発登録と複数ターンの会話を検証できます。ローカル D1 と LINE API のモックを使用します。`-t 'Workers AI dialogue.*review'` でレビュー指摘の8件に絞れます。一部にはモデルへ回答形式を指定する検証が含まれます。評価時だけ合成入力に対するモデルの生出力と D1 に反映された予定が表示されます。既存の79ケースのIntent評価で全件を実モデルに送る場合は `MODEL_ONLY_INTENT_EVAL=1` を併用します。
 
@@ -87,11 +87,38 @@ npm.cmd test -- tests/webhook.test.ts -t 'Workers AI dialogue'
 Remove-Item Env:RUN_REAL_DIALOGUE_EVAL
 ```
 
+### Gemini を試す
+
+Gemini Developer API の `gemini-3.5-flash-lite` を使います。テキストの入出力は無料枠で利用でき、実際の上限はプロジェクトごとに Google AI Studio で確認できます。Google の無料サービスの規約に従い、試用には個人情報や機密情報を含まない合成メッセージを使ってください。[料金](https://ai.google.dev/gemini-api/docs/pricing#gemini-3.5-flash-lite) · [利用上限](https://ai.google.dev/gemini-api/docs/rate-limits) · [利用規約](https://ai.google.dev/gemini-api/terms)
+
+`.dev.vars.example` を `.dev.vars.gemini` にコピーし、テスト用の LINE シークレット2件と、Google AI Studio で作った `GEMINI_API_KEY` を設定します。Gemini のモデルを変更する場合は `GEMINI_MODEL` を指定します。[API キーの作成](https://aistudio.google.com/apikey)
+
+```powershell
+npx.cmd wrangler d1 migrations apply DB --local --env gemini
+npm.cmd run dev -- --env gemini --local
+```
+
+`gemini` 環境では Gemini を優先し、試用専用のローカル D1 を使います。ローカル Worker とテスト用 LINE グループを接続し、Bot にメンションして登録や通知変更を試せます。Workers AI への切り替えも試す場合は、Wrangler にログインして `npm.cmd run dev -- --env gemini` で起動します。Workers AI はリモートで実行され、D1 はローカルです。
+
+予定通知や Inbox の再試行を確認する場合は、公開トンネルを停止し、使っている起動コマンドに `--test-scheduled` を追加します。起動ログに `DB (line-reminder-bot-gemini)` が表示されたことを確認し、`Ready on` に出たポートで前節の Cron 確認コマンドを実行してください。
+
+実モデルの疎通確認には `GEMINI_API_KEY` だけ設定すれば、以下の合成ケースを実行できます。
+
+```powershell
+$env:RUN_REAL_GEMINI_EVAL = '1'
+$env:MODEL_ONLY_INTENT_EVAL = '1'
+node --env-file=.dev.vars.gemini node_modules/vitest/vitest.mjs run tests/intent-eval.test.ts -t 'Gemini API.*さっきのやつ、14日前も'
+Remove-Item Env:RUN_REAL_GEMINI_EVAL, Env:MODEL_ONLY_INTENT_EVAL
+```
+
+精度比較には同じ `tests/intent-eval.test.ts` を使います。Gemini で全件を評価するには `-t 'Gemini API'` を指定します。Workers AI では `RUN_REAL_INTENT_EVAL=1` と `MODEL_ONLY_INTENT_EVAL=1` を設定して `-t 'Workers AI'` を指定します。どちらも操作の解釈と、通知変更後の予定を同じ期待値で検証します。
+
 ## 設定と本番反映
 
-思考生成オフを正式採用しています。通常処理・再試行・実モデル評価はすべて思考生成オフで実行します。
+Workers AI では思考生成オフを採用しています。Gemini 3.5 Flash-Lite はモデル既定の `minimal` で実行します。
 
 - `wrangler.jsonc` の `ai.binding` は `AI`、`vars.AI_MODEL` の初期値は `@cf/qwen/qwen3.8-27b` です。このモデルでは応答時間を抑えるため `reasoning_effort: "low"` と `chat_template_kwargs.enable_thinking: false` を指定します。日本語と JSON 出力をサポートする Workers AI モデルを指定してください。Workers AI バインディングはアカウントに紐づき、専用の API キーを Worker に置く必要はありません。ローカルで実推論を試す場合は Workers AI を利用できるアカウントで `npx.cmd wrangler login` してください。[モデル仕様](https://developers.cloudflare.com/workers-ai/models/qwen3.8-27b/)
-- `ai_unavailable` は Workers AI 呼び出しの失敗です。旧モデル `@cf/qwen/qwen3-30b-a3b-fp8` は2026年11月20日に提供終了となり、エラー5028を返します。最新の設定で Worker を再起動し、ローカルの `.dev.vars` や環境変数で旧モデルを上書きしていないか確認してください。[提供終了の案内](https://developers.cloudflare.com/changelog/post/2026-11-05-planned-model-deprecations/)
+- 既定の `AI_PROVIDER=auto` は、`GEMINI_API_KEY` があれば Gemini を優先します。利用枠超過などで Gemini の呼び出しが失敗した場合は、残りの推論時間で Workers AI を試します。時間切れの場合は Inbox の再試行で Workers AI を呼び出します。キーが未設定の場合は最初から Workers AI を使用します。推論先を固定するには `AI_PROVIDER=gemini` または `AI_PROVIDER=workers-ai` を指定します。
+- `ai_unavailable` は推論 API の呼び出し失敗です。Gemini から HTTP エラーが返った場合、Worker のログにステータスコードが出ます。Workers AI の旧モデル `@cf/qwen/qwen3-30b-a3b-fp8` は2026年11月20日に提供終了となり、エラー5028を返します。Workers AI でこのエラーが出た場合は、`AI_MODEL` の上書き設定を確認してください。[提供終了の案内](https://developers.cloudflare.com/changelog/post/2026-11-05-planned-model-deprecations/)
 - 承認後、`wrangler.jsonc` の D1 ID を実際のものに置き換え、`npx.cmd wrangler d1 migrations apply DB --remote` で `0009` までの未適用分を適用します。ローカルでは `npx.cmd wrangler d1 migrations apply DB --local` を使います。既存のタスク・送信履歴は保持されます。新バージョンで旧2本の Cron が無効になり、毎分 Cron が有効になったことを確認します。移行前に旧方式で同日の前日通知が受理されたか不明な場合も、重複防止のため同じ前日20時の枠をスキップします。
-- LINE Secrets を Git 管理外の `.env.production` に設定して `npx.cmd wrangler deploy --secrets-file .env.production` で手動反映します。テストグループで登録・通知・引用返信を確認後、家族グループで使います。通知の通数は LINE のプラン、推論は Workers AI の利用量に応じます。[LINE の料金](https://developers.line.biz/ja/docs/messaging-api/pricing/) · [Workers AI 料金](https://developers.cloudflare.com/workers-ai/platform/pricing/)
+- LINE Secrets を Git 管理外の `.env.production` に設定して `npx.cmd wrangler deploy --secrets-file .env.production` で手動反映します。Gemini を有効にする場合は `GEMINI_API_KEY` も同じファイルに設定します。テストグループで登録・通知・引用返信を確認後、家族グループで使います。通知の通数は LINE のプラン、推論の上限は各 AI プロバイダーの利用枠に応じます。[LINE の料金](https://developers.line.biz/ja/docs/messaging-api/pricing/) · [Workers AI 料金](https://developers.cloudflare.com/workers-ai/platform/pricing/)

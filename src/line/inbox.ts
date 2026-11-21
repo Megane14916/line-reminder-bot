@@ -13,6 +13,7 @@ import { reminderSlots, ruleSchema } from '../tasks/schedule'
 import { cleanTargetReference, namesTarget } from '../tasks/target-matching'
 import { aiTimeout, runtimeBudget, type RuntimeBudget } from '../runtime-budget'
 import { parseIntent, quickQuotedIntent } from './intent-parser'
+import { configuredInference } from './intent-inference'
 import { formatIntentError, helpMessage } from './messages'
 import { drainResults, expiredOperationResults, failedInference, unknownOperation } from './outbox'
 
@@ -22,7 +23,7 @@ export type Operation = Omit<TaskEvent, 'now' | 'inbox'> & { replyToken: string;
 type Entry = { receipt_id: number; group_id: string }
 type Claimed = Entry & {
   event_id: string; user_id: string; event_time: number; received_at: number
-  input_json: string; action_json: string | null; attempts: number
+  input_json: string; action_json: string | null; attempts: number; last_error: string | null
 }
 type InboxEvent = TaskEvent & { inbox: NonNullable<TaskEvent['inbox']> }
 
@@ -120,7 +121,7 @@ function claim(db: D1Database, groupId: string, token: string, now: number) {
   return db.prepare(`UPDATE webhook_inbox SET status = 'running', attempts = attempts + 1, lease_token = ?, lease_until = ?
     WHERE receipt_id = (SELECT q.receipt_id FROM webhook_inbox q WHERE q.group_id = ?
       AND ${ready} AND ${head} AND ${unlocked} LIMIT 1)
-    RETURNING receipt_id, event_id, group_id, user_id, event_time, received_at, input_json, action_json, attempts`)
+    RETURNING receipt_id, event_id, group_id, user_id, event_time, received_at, input_json, action_json, attempts, last_error`)
     .bind(token, now + leaseMs, groupId, now, now, maxAttempts, now - retention, now).first<Claimed>()
 }
 
@@ -248,7 +249,7 @@ async function processEvent(env: Env, row: Claimed, event: InboxEvent, budget: R
         const rule = contextualTask ? ruleSchema.parse(JSON.parse(contextualTask.reminder_rule)) : undefined
         const timeout = Math.min(aiTimeout(env), budget.remaining() - 3000)
         if (timeout <= 0) return
-        const parsed = await parseIntent(env.AI, env.AI_MODEL, event.text, event.eventTime, timeout, {
+        const parsed = await parseIntent(configuredInference(env, row.last_error), event.text, event.eventTime, timeout, {
           quoted: !!quote, question: pending?.question, pending, original: stored?.original ?? original,
           followup: input.type === 'followup' || Boolean(quote?.thread_question),
           recentConversation: history.length ? history : undefined,

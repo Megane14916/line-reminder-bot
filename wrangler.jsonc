@@ -5,7 +5,13 @@
   "compatibility_date": "2026-11-14",
   "triggers": { "crons": ["* * * * *"] },
   "ai": { "binding": "AI" },
-  "vars": { "AI_MODEL": "@cf/qwen/qwen3.8-27b", "AI_TIMEOUT_MS": "12000", "LINE_TIMEOUT_MS": "10000" },
+  "vars": {
+    "AI_PROVIDER": "auto",
+    "AI_MODEL": "@cf/qwen/qwen3.8-27b",
+    "GEMINI_MODEL": "gemini-3.5-flash-lite",
+    "AI_TIMEOUT_MS": "12000",
+    "LINE_TIMEOUT_MS": "10000"
+  },
   "d1_databases": [
     {
       "binding": "DB",
@@ -15,5 +21,27 @@
   ],
   "secrets": {
     "required": ["LINE_CHANNEL_SECRET", "LINE_CHANNEL_ACCESS_TOKEN"]
+  },
+  "env": {
+    "gemini": {
+      "ai": { "binding": "AI" },
+      "vars": {
+        "AI_PROVIDER": "auto",
+        "AI_MODEL": "@cf/qwen/qwen3.8-27b",
+        "GEMINI_MODEL": "gemini-3.5-flash-lite",
+        "AI_TIMEOUT_MS": "12000",
+        "LINE_TIMEOUT_MS": "10000"
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "line-reminder-bot-gemini",
+          "database_id": "00000000-0000-0000-0000-000000000004"
+        }
+      ],
+      "secrets": {
+        "required": ["LINE_CHANNEL_SECRET", "LINE_CHANNEL_ACCESS_TOKEN", "GEMINI_API_KEY"]
+      }
+    }
   }
 }
