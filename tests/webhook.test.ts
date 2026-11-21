@@ -1647,7 +1647,9 @@ test.each([
   await webhook([event('21時')])
   expect(line.mock.calls).toHaveLength(before + 1)
   expect(lastReply()).toBe('🔔 今日の何時に通知しますか？')
-  expect((await pendingThread())?.pending_json).toBe(state?.pending_json)
+  expect(JSON.parse(String((await pendingThread())?.pending_json))).toEqual({
+    ...JSON.parse(String(state?.pending_json)), original: physicsRequest,
+  })
   expect((await taskRows()).results).toEqual([])
 })
 
