@@ -1005,7 +1005,7 @@ describe.runIf(evaluationEnv.RUN_REAL_DIALOGUE_EVAL === '1')('Workers AI dialogu
     }
     const reasoning = evaluationEnv.AI_EVAL_REASONING
     const measuring = reasoning !== undefined
-    if (measuring && !['off', 'low', 'medium', 'xhigh'].includes(reasoning)) throw new Error('Unknown AI_EVAL_REASONING')
+    if (measuring && reasoning !== 'off') throw new Error('AI_EVAL_REASONING must be off. Thinking generation is disabled.')
     const samples: { elapsedMs?: number; completed?: boolean; error?: string; providerCode?: string; schema?: boolean; finishReason?: string;
       promptTokens?: number; completionTokens?: number; reasoningTokens?: number; reasoningCharacters?: number }[] = []
     const requests: Promise<unknown>[] = []
@@ -1016,9 +1016,8 @@ describe.runIf(evaluationEnv.RUN_REAL_DIALOGUE_EVAL === '1')('Workers AI dialogu
       const options = measuring ? { ...input,
         messages: input.messages.map((message) => message.role === 'system' && typeof message.content === 'string'
           ? { ...message, content: message.content.replace(/\/no_think/g, '') } : message),
-        reasoning_effort: reasoning === 'off' ? 'low' as const
-        : reasoning as 'low' | 'medium' | 'xhigh',
-        chat_template_kwargs: { ...input.chat_template_kwargs, enable_thinking: reasoning !== 'off' } } : input
+        reasoning_effort: 'low' as const,
+        chat_template_kwargs: { ...input.chat_template_kwargs, enable_thinking: false } } : input
       let timer: ReturnType<typeof setTimeout> | undefined
       const request = Promise.race([remote.env.AI.run(name, options),
         new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('evaluation_deadline')), 30_000) })])

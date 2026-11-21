@@ -59,6 +59,9 @@ test.each(cases)('validates and authorizes a structured mock Intent for $text', 
   const run = vi.fn().mockResolvedValue({ response: JSON.stringify(fixture.action) })
   await checkIntent({ run } as unknown as Ai, fixture)
   expect(run.mock.calls[0][1].messages[0].content).toContain('同じタスクに対する変更')
+  expect(run.mock.calls[0][1]).toMatchObject({
+    reasoning_effort: 'low', chat_template_kwargs: { enable_thinking: false },
+  })
 })
 
 test('questions an additive request if the model incorrectly requests a replacement', () => {

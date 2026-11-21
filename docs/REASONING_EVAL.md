@@ -1,6 +1,6 @@
 # Qwen 3.8 推論レベルの比較
 
-2026年11月21日、コミット `3bd759b` のBotで合成会話を評価した。現時点では思考生成オフを推奨する。思考を有効にした条件は、現在の12秒制限で時間切れが増えた。
+2026年11月21日、コミット `3bd759b` のBotで合成会話を評価した。その後、ユーザーの指示により思考生成オフを正式採用した。通常処理・再試行・今後の実モデル評価は思考生成オフで実行する。以下は採用判断に使った比較結果。
 
 ## 比較条件
 
@@ -53,7 +53,7 @@
 
 無料枠は毎日00:00 UTC、日本時間09:00にリセットされる。上限到達中はBotのAI応答も利用できない。利用量はアカウント全体で共有される。[Cloudflareの料金と上限](https://developers.cloudflare.com/workers-ai/platform/pricing/)
 
-計測は各条件1巡の小規模な結果であり、時間帯や混雑の影響がある。xhighの評価と逆順での再測定は未完了。思考生成オフは、得られた9件の全応答が20秒以内に返ってスキーマを満たしたが、20秒制限でD1まで確定する検証は別途必要。
+計測は各条件1巡の小規模な結果であり、時間帯や混雑の影響がある。xhighの評価と逆順での再測定は実施できなかった。採用後の検証は思考生成オフに限定する。思考生成オフは、得られた9件の全応答が20秒以内に返ってスキーマを満たしたが、20秒制限でD1まで確定する検証は別途必要。
 
 通常のBotには思考生成オフを使う方針とする。次の改善は入力の軽量化と、D1保存・結果通知の時間を確保した推論期限の調整。推論レベルを上げる効果は今回の評価範囲で確認できなかった。
 
@@ -63,12 +63,12 @@ Workers AIにログイン済みの環境で、以下を実行する。実AIの�
 
 ```powershell
 $env:RUN_REAL_DIALOGUE_EVAL = '1'
-$env:AI_EVAL_REASONING = 'off' # off / low / medium / xhigh
+$env:AI_EVAL_REASONING = 'off'
 $env:AI_EVAL_ROUND = '1'
 npm.cmd test -- tests/webhook.test.ts -t 'Workers AI dialogue.*autofill' --reporter dot --bail 1
 Remove-Item Env:RUN_REAL_DIALOGUE_EVAL, Env:AI_EVAL_REASONING, Env:AI_EVAL_ROUND
 ```
 
-計測モードは各ケースの `reasoningEvaluation` JSONに `passed`、所要時間、時間切れ、スキーマ適合、出力トークン数、思考過程の文字数を出力する。Vitestの成功は計測の完了を示す。操作の通過率にはJSONの `passed` を使う。エラー4006は計測を失敗として終了する。
+現在の計測モードは `off` のみ受け付ける。各ケースの `reasoningEvaluation` JSONに `passed`、所要時間、時間切れ、スキーマ適合、出力トークン数、思考過程の文字数を出力する。Vitestの成功は計測の完了を示す。操作の通過率にはJSONの `passed` を使う。エラー4006は計測を失敗として終了する。
 
 参照したモデル仕様は[Cloudflare Qwen 3.8](https://developers.cloudflare.com/workers-ai/models/qwen3.8-27b/)。
