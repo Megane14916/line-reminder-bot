@@ -22,3 +22,11 @@
 Webhook、ローカル D1、モック LINE API を通して、返信文、タスク、通知日時まで照合する。発言数が直近5件を超えるスレッド、新規メンション、元のスレッドへの再返信、別送信者・別グループ、再配送、全角入力、年越し、日本時間の日付またぎ、過去の通知時刻を回帰ケースに加える。
 
 実モデルは合成データで実行する。正しい対象・日時に初回で到達した件数、不要な確認、誤更新、12秒の推論制限内で完了した件数を記録する。
+
+Gemini を使う Webhook 回帰テストは、ローカルの `.dev.vars.gemini` に設定したキーで実行できる。LINE 送信と D1 はローカルのテスト環境を使う。
+
+```powershell
+$env:RUN_REAL_GEMINI_DIALOGUE_EVAL = '1'
+node --env-file=.dev.vars.gemini node_modules/vitest/vitest.mjs run tests/webhook.test.ts --exclude '**/.wrangler/**' -t 'Gemini preserves reminder dates'
+Remove-Item Env:RUN_REAL_GEMINI_DIALOGUE_EVAL
+```

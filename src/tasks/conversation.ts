@@ -10,43 +10,41 @@ export type Turn = {
   after?: ReminderRule
   changes?: NotificationChange[]
 }
-export type ConversationEntry = Turn & { taskId: number | null }
+export type ConversationEntry = Turn & { taskId: number | null; eventTime: number; reply?: string }
 type Actor = { groupId: string; userId: string; eventTime: number; now: number }
-const minutes = 45
-const limit = 5
 
-export async function conversationHistory(db: D1Database, event: Actor): Promise<ConversationEntry[]> {
-  const { results } = await db.prepare(`SELECT task_id, turn_json FROM task_conversation
-    WHERE group_id = ? AND user_id = ? AND event_time <= ? AND expires_at > ?
-    ORDER BY event_time DESC, rowid DESC LIMIT ?`).bind(event.groupId, event.userId, event.eventTime, event.now, limit)
-    .all<{ task_id: number | null; turn_json: string }>()
-  return results.map((row) => ({ ...JSON.parse(row.turn_json) as Turn, taskId: row.task_id }))
+export async function conversationHistory(db: D1Database, event: Actor, threadId: string): Promise<ConversationEntry[]> {
+  const { results } = await db.prepare(`SELECT c.task_id, c.turn_json, c.event_time,
+      CASE WHEN o.status = 'sent' THEN c.reply_text END AS reply
+    FROM task_conversation c JOIN dialogue_threads d ON d.id = c.thread_id
+    LEFT JOIN operation_result_outbox o ON o.event_id = c.event_id
+    WHERE c.thread_id = ? AND d.group_id = ? AND d.user_id = ? AND c.event_time <= ? AND d.expires_at > ?
+    ORDER BY c.event_time, c.rowid`).bind(threadId, event.groupId, event.userId, event.eventTime, event.now)
+    .all<{ task_id: number | null; turn_json: string; event_time: number; reply: string | null }>()
+  return results.map((row) => ({ ...JSON.parse(row.turn_json) as Turn, taskId: row.task_id,
+    eventTime: row.event_time, reply: row.reply ?? undefined }))
 }
 
 export function notificationFocus(history: ConversationEntry[], taskId: number, version: number) {
-  const latest = history.find((entry) => entry.taskId === taskId && entry.changes?.length)
+  const latest = history.findLast((entry) => entry.taskId === taskId && entry.changes?.length)
   if (latest?.version !== version || latest.changes?.length !== 1) return
   return latest.changes[0]
 }
 
-export function storeConversation(db: D1Database, event: Actor & { eventId: string }, turn: Turn, checkTaskId?: number) {
-  return db.prepare(`INSERT INTO task_conversation (event_id, group_id, user_id, task_id, event_time, expires_at, turn_json)
-    SELECT ?, ?, ?, task_id, ?, ?, ? FROM operation_result_outbox WHERE event_id = ?
-      AND (? IS NULL OR task_id = ?)`)
-    .bind(event.eventId, event.groupId, event.userId, event.eventTime, event.now + minutes * 60_000,
-      JSON.stringify(turn), event.eventId, checkTaskId ?? null, checkTaskId ?? null)
-}
-
-export function trimConversation(db: D1Database, event: Actor) {
-  return db.prepare(`DELETE FROM task_conversation WHERE rowid IN (
-    SELECT rowid FROM task_conversation WHERE group_id = ? AND user_id = ?
-    ORDER BY event_time DESC, rowid DESC LIMIT -1 OFFSET ?)`).bind(event.groupId, event.userId, limit)
+export function storeConversation(db: D1Database, event: Actor & { eventId: string }, threadId: string, turn: Turn, checkTaskId?: number) {
+  return db.prepare(`INSERT INTO task_conversation (event_id, group_id, user_id, task_id, event_time, expires_at, turn_json, thread_id, reply_text)
+    SELECT ?, d.group_id, d.user_id, o.task_id, ?, d.expires_at, CASE WHEN ? IS NULL OR o.task_id = ? THEN ? ELSE ? END, d.id, o.text
+    FROM dialogue_threads d LEFT JOIN operation_result_outbox o ON o.event_id = ?
+    WHERE d.id = ? AND d.group_id = ? AND d.user_id = ?
+      AND (o.event_id IS NULL OR o.thread_id = ?)`)
+    .bind(event.eventId, event.eventTime, checkTaskId ?? null, checkTaskId ?? null, JSON.stringify(turn),
+      JSON.stringify({ operation: 'answer', request: turn.request }), event.eventId, threadId, event.groupId, event.userId, threadId)
 }
 
 export function expireConversation(db: D1Database, now: number) {
   return db.batch([
     db.prepare(`DELETE FROM task_conversation WHERE event_id IN (
-      SELECT event_id FROM task_conversation WHERE expires_at <= ? ORDER BY expires_at LIMIT 100)`).bind(now),
+      SELECT event_id FROM task_conversation WHERE thread_id IS NULL AND expires_at <= ? ORDER BY expires_at LIMIT 100)`).bind(now),
     db.prepare(`DELETE FROM task_contexts WHERE rowid IN (
       SELECT rowid FROM task_contexts WHERE expires_at <= ? LIMIT 100)`).bind(now),
     db.prepare(`DELETE FROM dialogue_threads WHERE id IN (

@@ -1,6 +1,6 @@
 import { formatIntentError } from '../line/messages'
 import type { Clarification } from './intent'
-import { applyEvent, getContext, saveContext, type TaskEvent } from './repository'
+import { applyEvent, saveContext, type TaskEvent } from './repository'
 import type { PendingDialogue } from './dialogue'
 import { dateTimeEvidence } from './draft'
 import { explicitNotificationDates, relativeDays } from './notification-dates'
@@ -15,11 +15,11 @@ export async function askClarification(db: D1Database, event: TaskEvent, questio
 }
 
 export async function holdDialogue(db: D1Database, event: TaskEvent, pending: PendingDialogue, taskId?: number) {
-  const context = await getContext(db, event)
-  const thread = { ...(event.thread ?? { id: event.eventId, original: event.text ?? '', taskId: null }), pending }
+  const thread = { ...(event.thread ?? { id: event.eventId, original: event.text ?? '', taskId: null }),
+    pending: { ...pending, original: pending.original ?? event.utterance ?? event.text }, selection: undefined }
   thread.taskId = taskId ?? thread.taskId
   if (await applyEvent(db, { ...event, thread, linkTask: thread.taskId !== null, turn: { operation: 'clarify', question: pending.prompt } },
-    pending.prompt, saveContext(db, event, 'clarification', thread.taskId ?? context?.task_id ?? null))) return pending.prompt
+    pending.prompt, saveContext(db, event, 'clarification', thread.taskId))) return pending.prompt
 }
 
 // An unaddressed group message needs a bounded, pending-question-shaped signal before intake.

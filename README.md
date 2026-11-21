@@ -23,7 +23,9 @@ LINE グループで家族の提出物や持ち物を管理します。Bot に�
 
 時刻を省略すると、指定した通知や引用したリマインダーの時刻、タスク内で最も多い時刻、グループの既定時刻、20:00の順に参照します。朝・夕方・夜の指定があればその時間帯に合う時刻を使い、候補がなければそれぞれ8:00・18:00・20:00です。結果への返信で「なんで20時にしたの？」「やっぱ9時にして」「今の追加はなしで」と伝えられます。
 
-対象や締切など、必要な情報を決められない場合は質問します。質問は10分間有効です。質問への引用返信でも続けられ、「やっぱ今のなしで」で取り消せます。以前から時刻の回答待ちだった場合も「いつもの時間で」「任せる」「朝でいい」と答えられます。確定した返信は最後のやり取りから45分間、同じスレッドのタスクや通知を参照できます。引用返信で別のタスクを登録すると、その依頼から新しい会話が始まります。
+Bot をメンションするたびに、新しい会話が始まります。既存タスクをメンションから操作する場合はタスク名を添えてください。Bot の返信を引用すると、その会話の最初からのやり取りを参照します。途中で別の依頼をメンションした場合も、元の返信を引用すれば続けられます。確定した返信は最後のやり取りから45分間有効です。
+
+必要な情報が足りないときは質問します。質問は10分間有効です。質問に引用返信するか、確認待ちの依頼が1件なら「21時で」のように短く答えられます。「やっぱ今のなしで」で取り消せます。「明日教科書を持っていく。今日の夜に通知して」と送ると、日本時間で明日を必要日、今日の夜を通知日時として扱います。
 
 Bot の登録結果・通知設定・リマインダーなどを LINE で引用すると、メンションなしで操作できます。たとえば登録結果に「2週間前にも」、リマインダーに「もう終わった」と返信します。一覧への返信ではタスク名を添えてください。LINE が引用元の ID を返さなかった場合や、ID の記録前に送った場合は、Bot をメンションして操作してください。
 
@@ -120,5 +122,5 @@ Workers AI では思考生成オフを採用しています。Gemini 3.5 Flash-L
 - `wrangler.jsonc` の `ai.binding` は `AI`、`vars.AI_MODEL` の初期値は `@cf/qwen/qwen3.8-27b` です。このモデルでは応答時間を抑えるため `reasoning_effort: "low"` と `chat_template_kwargs.enable_thinking: false` を指定します。日本語と JSON 出力をサポートする Workers AI モデルを指定してください。Workers AI バインディングはアカウントに紐づき、専用の API キーを Worker に置く必要はありません。ローカルで実推論を試す場合は Workers AI を利用できるアカウントで `npx.cmd wrangler login` してください。[モデル仕様](https://developers.cloudflare.com/workers-ai/models/qwen3.8-27b/)
 - 既定の `AI_PROVIDER=auto` は、`GEMINI_API_KEY` があれば Gemini を優先します。利用枠超過などで Gemini の呼び出しが失敗した場合は、残りの推論時間で Workers AI を試します。時間切れの場合は Inbox の再試行で Workers AI を呼び出します。キーが未設定の場合は最初から Workers AI を使用します。推論先を固定するには `AI_PROVIDER=gemini` または `AI_PROVIDER=workers-ai` を指定します。
 - `ai_unavailable` は推論 API の呼び出し失敗です。Gemini から HTTP エラーが返った場合、Worker のログにステータスコードが出ます。Workers AI の旧モデル `@cf/qwen/qwen3-30b-a3b-fp8` は2026年11月20日に提供終了となり、エラー5028を返します。Workers AI でこのエラーが出た場合は、`AI_MODEL` の上書き設定を確認してください。[提供終了の案内](https://developers.cloudflare.com/changelog/post/2026-11-05-planned-model-deprecations/)
-- 承認後、`wrangler.jsonc` の D1 ID を実際のものに置き換え、`npx.cmd wrangler d1 migrations apply DB --remote` で `0009` までの未適用分を適用します。ローカルでは `npx.cmd wrangler d1 migrations apply DB --local` を使います。既存のタスク・送信履歴は保持されます。新バージョンで旧2本の Cron が無効になり、毎分 Cron が有効になったことを確認します。移行前に旧方式で同日の前日通知が受理されたか不明な場合も、重複防止のため同じ前日20時の枠をスキップします。
+- 承認後、`wrangler.jsonc` の D1 ID を実際のものに置き換え、新しい Worker をデプロイする前に `npx.cmd wrangler d1 migrations apply DB --remote` で `0010` までの未適用分を適用します。ローカルでは `npx.cmd wrangler d1 migrations apply DB --local` を使います。既存のタスク・送信履歴は保持されます。移行済みの会話については、旧版で消去済みの返信本文を除いた履歴を引き継ぎます。
 - LINE Secrets を Git 管理外の `.env.production` に設定して `npx.cmd wrangler deploy --secrets-file .env.production` で手動反映します。Gemini を有効にする場合は `GEMINI_API_KEY` も同じファイルに設定します。テストグループで登録・通知・引用返信を確認後、家族グループで使います。通知の通数は LINE のプラン、推論の上限は各 AI プロバイダーの利用枠に応じます。[LINE の料金](https://developers.line.biz/ja/docs/messaging-api/pricing/) · [Workers AI 料金](https://developers.cloudflare.com/workers-ai/platform/pricing/)

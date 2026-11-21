@@ -2,7 +2,7 @@ import { formatGroupReminderSettings, formatIntentError, formatReminderDateQuery
   formatTaskList, formatTaskMessage, formatTaskResult, helpMessage } from '../line/messages'
 import { intentSchema, type TargetAction, type TaskAction } from './intent'
 import { askClarification } from './clarification'
-import { applyEvent, findTasks, getContext, getTask, groupReminderRule, listTasks, mentionsOtherTask, onlyOpenTask, pendingContext, saveContext,
+import { applyEvent, findTasks, getContext, getTask, groupReminderRule, listTasks, mentionsOtherTask, pendingContext, saveContext,
   type Task, type TaskEvent } from './repository'
 import { editReminder } from './reminder-edits'
 import { applyNotificationPlan, matchingReminderTimes, scheduledTime } from './notification-plan'
@@ -47,15 +47,17 @@ async function createTask(db: D1Database, event: TaskEvent, action: Extract<Task
 }
 
 export async function answerSelection(db: D1Database, event: TaskEvent, id: number) {
-  const context = await getContext(db, event)
-  const pending = pendingContext(context)
-  if (!pending || pending.kind === 'clarification' || !context?.pending_json) return
+  const context = event.thread ? null : await getContext(db, event)
+  const legacy = pendingContext(context)
+  const pending = event.thread?.selection ?? (legacy?.kind === 'clarification' ? undefined : legacy)
+  if (!pending) return
   if (!pending.ids.includes(id)) return '候補にある選択用の番号を、#も付けて送ってください。'
   const selected = intentSchema.safeParse({ ...(pending.action as object), target: { by: 'id', id } })
   if (selected.success && 'target' in selected.data) {
     const task = await getTask(db, event.groupId, id)
     if (!task || (task.deleted_at !== null) !== (selected.data.type === 'restore_task')) return '該当するタスクが見つかりません。'
-    return changeTask(db, event, selected.data, task, { pending: context.pending_json })
+    const thread = event.thread && { ...event.thread, selection: undefined }
+    return changeTask(db, { ...event, thread }, selected.data, task, context?.pending_json ? { pending: context.pending_json } : undefined)
   }
 }
 
@@ -64,7 +66,6 @@ async function targetOperation(db: D1Database, event: TaskEvent, action: TargetA
   const deleted = action.type === 'restore_task'
   const quoteId = event.quoteTaskId
   let task: Task | null = null
-  let contextId: number | null | undefined
   if (target.by === 'name') {
     const candidates = await findTasks(db, event.groupId, target.name, target.dueDate, deleted, target)
     if (quoteId && (!candidates?.some(({ id }) => id === quoteId) ||
@@ -72,28 +73,23 @@ async function targetOperation(db: D1Database, event: TaskEvent, action: TargetA
     if (!candidates) return askClarification(db, event, 'task')
     if (!candidates.length) return 'その条件に合うタスクは見つかりません。'
     if (!quoteId && event.text && !namesTarget(event.text, target.name) && !candidates.some((candidate) => namesTarget(event.text!, candidate.title))) {
-      const contextualId = event.thread?.taskId ?? (await getContext(db, event))?.task_id
+      const contextualId = event.thread?.taskId ?? event.explicitTaskId
       if (candidates.length !== 1 || candidates[0].id !== contextualId) return askClarification(db, event, 'task')
     }
     if (quoteId) task = candidates.find(({ id }) => id === quoteId) ?? null
     else if (candidates.length > 1) {
       const options = candidates.slice(0, 5)
       const { target: _target, ...operation } = action
-      const pending = JSON.stringify({ action: operation, ids: options.map(({ id }) => id) })
+      const selection = { action: operation, ids: options.map(({ id }) => id) }
+      const thread = event.thread && { ...event.thread, pending: undefined, selection }
       const reply = formatTaskCandidates(options, candidates.length > 5, event.now)
-      if (await applyEvent(db, event, reply, saveContext(db, event, action.type, null, pending))) return reply
+      if (await applyEvent(db, { ...event, thread, turn: { operation: 'selection' } }, reply, saveContext(db, event, action.type, null,
+        thread ? null : JSON.stringify(selection)))) return reply
       return
     } else task = candidates[0]
   } else {
     if (target.by === 'id' && quoteId && quoteId !== target.id) return quotationConflict
-    if (target.by === 'recent' && quoteId === undefined && !event.explicitTaskId && !event.thread?.taskId) {
-      contextId = (await getContext(db, event))?.task_id
-    }
-    const scoped = target.by === 'id' ? target.id : quoteId === undefined
-      ? event.explicitTaskId ?? event.thread?.taskId ?? contextId : quoteId
-    const mayUseOnly = quoteId === undefined && target.by === 'recent' &&
-      (action.type === 'edit_notifications' || action.type === 'enable_reminder' || action.type === 'get_reminder' || action.type === 'get_reminder_reason')
-    const id = scoped ?? (mayUseOnly ? (await onlyOpenTask(db, event.groupId))?.id : undefined)
+    const id = target.by === 'id' ? target.id : quoteId === undefined ? event.explicitTaskId ?? event.thread?.taskId : quoteId
     if (!id && target.by === 'recent') {
       const individual = action.type === 'edit_notifications' && action.edits.find((edit) =>
         edit.op === 'move' && edit.selector.kind === 'recent' && edit.to.kind === 'time')
@@ -107,13 +103,13 @@ async function targetOperation(db: D1Database, event: TaskEvent, action: TargetA
     }
   }
   if (!task || (task.deleted_at !== null) !== deleted) return '該当するタスクが見つかりません。タスク名や期限を教えてください。'
-  return changeTask(db, event, action, task, contextId === task.id ? { recent: task.id } : undefined)
+  return changeTask(db, event, action, task)
 }
 
 const quotationConflict = '💬 引用したタスクと本文のタスク名が異なります。\n操作したいタスク名をメンション付きで送ってください。'
 
 async function changeTask(db: D1Database, event: TaskEvent, action: TargetAction, task: Task,
-  context?: { pending: string } | { recent: number }) {
+  context?: { pending: string }) {
   let rule = ruleSchema.parse(JSON.parse(task.reminder_rule))
   const beforeRule = rule
   let anchor = task.reminder_anchor ?? task.created_at
@@ -127,7 +123,7 @@ async function changeTask(db: D1Database, event: TaskEvent, action: TargetAction
   }
   switch (action.type) {
     case 'get_reminder_reason': {
-      const turn = event.quotedTurn ?? event.history?.find((entry) => entry.taskId === task.id && entry.changes?.some((change) => change.timeSource))
+      const turn = event.quotedTurn ?? event.history?.findLast((entry) => entry.taskId === task.id && entry.changes?.some((change) => change.timeSource))
       const reply = formatNotificationReason(title, turn?.changes ?? [], explicitNotificationTimes(event.text ?? '')[0])
       if (await applyEvent(db, { ...event, linkTask: true }, reply, saveContext(db, event, action.type, task.id))) return reply
       return
@@ -279,8 +275,8 @@ async function changeTask(db: D1Database, event: TaskEvent, action: TargetAction
       ? formatReminderSettings(heading, title, reminder, event.now) + details
       : formatTaskMessage(heading, title)
   const contextGuard = context ? `AND EXISTS (SELECT 1 FROM task_contexts WHERE group_id = ? AND user_id = ?
-    AND ${'pending' in context ? 'pending_json' : 'task_id'} = ? AND expires_at > ? AND updated_at <= ?)` : ''
-  const contextBindings = context ? [event.groupId, event.userId, 'pending' in context ? context.pending : context.recent, event.now, event.eventTime] : []
+    AND pending_json = ? AND expires_at > ? AND updated_at <= ?)` : ''
+  const contextBindings = context ? [event.groupId, event.userId, context.pending, event.now, event.eventTime] : []
   const changes: D1PreparedStatement[] = []
   if (active && task.reminder_enabled && (action.type === 'edit_notifications' || action.type === 'update_task' ||
     action.type === 'modify_reminder' && ['add', 'add_time', 'remove'].includes(action.edit.mode))) {

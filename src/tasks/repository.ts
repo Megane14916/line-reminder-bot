@@ -1,8 +1,8 @@
 import type { Clarification, TaskAction } from './intent'
 import { saveOperationResult, type OperationResult } from '../line/outbox'
 import { namesTarget, taskKey } from './target-matching'
-import { storeConversation, trimConversation, type ConversationEntry, type Turn } from './conversation'
-import { saveDialogue, supersedeDialogues, type Dialogue, type PendingDialogue } from './dialogue'
+import { storeConversation, type ConversationEntry, type Turn } from './conversation'
+import { saveDialogue, type Dialogue, type PendingDialogue } from './dialogue'
 import { ruleSchema } from './schedule'
 import type { Daypart } from './notification-clock'
 
@@ -14,6 +14,7 @@ export type Task = {
 export type TaskEvent = {
   groupId: string; userId: string; eventId: string; eventTime: number; now: number
   text?: string
+  utterance?: string
   messageId?: string
   thread?: Dialogue
   startsThread?: boolean
@@ -65,12 +66,6 @@ export async function findTasks(db: D1Database, groupId: string, name: string, d
   return (exact.length || key.length < 2 ? exact : candidates.filter((task) => namesTarget(task.title, name))).slice(0, 6)
 }
 
-export async function onlyOpenTask(db: D1Database, groupId: string) {
-  const { results } = await db.prepare("SELECT * FROM tasks WHERE group_id = ? AND status = 'open' AND deleted_at IS NULL LIMIT 2")
-    .bind(groupId).all<Task>()
-  return results.length === 1 ? results[0] : undefined
-}
-
 export async function groupReminderRule(db: D1Database, groupId: string) {
   const value = await db.prepare('SELECT rule_json FROM group_reminder_defaults WHERE group_id = ?').bind(groupId).first<string>('rule_json')
   return value ? ruleSchema.parse(JSON.parse(value)) : undefined
@@ -99,13 +94,15 @@ export function getTask(db: D1Database, groupId: string, id: number) {
 }
 
 export const sentMessage = `SELECT task_id, NULL AS scheduled_at, thread_id, thread_question,
-    (SELECT turn_json FROM task_conversation WHERE event_id = operation_result_outbox.event_id) AS turn_json FROM operation_result_outbox
+    (SELECT turn_json FROM task_conversation WHERE event_id = operation_result_outbox.event_id) AS turn_json,
+    (SELECT user_id FROM webhook_inbox WHERE event_id = operation_result_outbox.event_id) AS owner_id FROM operation_result_outbox
   WHERE group_id = ? AND line_message_id = ? AND status = 'sent'
-  UNION ALL SELECT task_id, scheduled_at, NULL, 0, NULL FROM reminder_occurrences WHERE group_id = ? AND line_message_id = ? AND status = 'sent'`
+  UNION ALL SELECT task_id, scheduled_at, NULL, 0, NULL, NULL FROM reminder_occurrences WHERE group_id = ? AND line_message_id = ? AND status = 'sent'`
 
 export function getBotMessage(db: D1Database, groupId: string, messageId: string) {
   return db.prepare(sentMessage).bind(groupId, messageId, groupId, messageId)
-    .first<{ task_id: number | null; scheduled_at: number | null; thread_id: string | null; thread_question: number; turn_json: string | null }>()
+    .first<{ task_id: number | null; scheduled_at: number | null; thread_id: string | null; thread_question: number;
+      turn_json: string | null; owner_id: string | null }>()
 }
 
 export function pendingContext(context: TaskContext | null) {
@@ -155,22 +152,20 @@ async function commitEvent(db: D1Database, event: TaskEvent, changes: D1Prepared
     : db.prepare('INSERT INTO processed_events (event_id, processed_at) VALUES (?, ?)').bind(event.eventId, now)
   const completion: D1PreparedStatement[] = []
   if (inbox) {
+    const thread = event.thread
     if (result) {
-      const thread = event.thread
       completion.push(saveOperationResult(db, inbox.receiptId, result, now, failure?.startsWith('ai_') ?? false, !!event.linkTask,
         thread?.id, !!thread?.pending, event.messageId))
       if (thread) {
         const [change] = event.turn?.changes ?? []
         const focus = event.turn?.changes?.length === 1 && change.after && event.turn.version !== undefined
           ? { ...change, version: event.turn.version } : event.turn?.changes?.length ? undefined : thread.focus
-        completion.push(saveDialogue(db, event, { ...thread, focus }))
-        if (event.startsThread) completion.push(supersedeDialogues(db, event, thread.id))
+        completion.push(saveDialogue(db, event, { ...thread, focus }, typeof result !== 'string'))
       }
     }
-    if (result && event.text && (event.turn || advance)) {
+    if (thread && event.utterance !== undefined) {
       const { taskId, ...details } = event.turn ?? {}
-      completion.push(storeConversation(db, event, { operation: 'answer', ...details, request: event.text.slice(0, 180) }, taskId),
-        trimConversation(db, event))
+      completion.push(storeConversation(db, event, thread.id, { operation: 'answer', ...details, request: event.utterance }, taskId))
     }
     completion.push(db.prepare(`UPDATE webhook_inbox SET status = ?, finished_at = ?, last_error = ?, input_json = NULL,
       action_json = NULL, reply_token = NULL, lease_token = NULL, lease_until = NULL WHERE receipt_id = ?`)
